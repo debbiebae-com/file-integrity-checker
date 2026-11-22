@@ -1,0 +1,3 @@
+Golf sample document.
+The avalanche effect means a tiny input change produces a large
+output change - about half of the digest bits flip on average.

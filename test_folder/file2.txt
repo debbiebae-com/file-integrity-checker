@@ -1,0 +1,3 @@
+Bravo sample document.
+Integrity monitoring catches silent changes to files on disk.
+A single altered byte is enough to change the entire hash.

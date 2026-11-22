@@ -1,0 +1,3 @@
+Foxtrot sample document.
+SHA-1 is shown here for comparison only. It has known collision
+weaknesses, so production systems should use SHA-256 instead.

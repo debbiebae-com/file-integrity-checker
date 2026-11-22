@@ -1,0 +1,3 @@
+Echo sample document.
+Record a baseline hash today, compare it tomorrow, and you know
+whether the file changed in between.

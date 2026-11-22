@@ -1,0 +1,3 @@
+Charlie sample document.
+Hashes are one-way functions: you cannot rebuild a file from its digest.
+Two different files should never share the same digest.

@@ -1,0 +1,3 @@
+Delta sample document.
+Reading a file in 4096-byte chunks keeps memory use low.
+Large files can be hashed without loading them completely.

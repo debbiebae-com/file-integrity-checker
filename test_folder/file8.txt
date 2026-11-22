@@ -1,0 +1,3 @@
+Hotel sample document.
+This is the eighth and final sample file in the test folder.
+Everything here is local, harmless, educational content.
