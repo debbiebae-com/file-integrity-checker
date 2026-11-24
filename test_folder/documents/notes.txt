@@ -1,0 +1,2 @@
+Notes for the FileWatch project.
+This file lives in documents/ and is picked up by the recursive walk.

@@ -536,5 +536,526 @@ class TestShippedSampleFolder(unittest.TestCase):
         self.assertEqual(len(set(results.values())), len(results))
 
 
+# ===========================================================================
+# WEEK 2 TESTS - pytest, using the tmp_path fixture
+# ===========================================================================
+#
+# These are plain module-level functions, which means BOTH runners work:
+#
+#     pytest -v                 # recommended for the Week 2 tests
+#     python -m unittest -v     # Week 1 runner, still fully supported
+#
+# Every test works inside pytest's `tmp_path`, so the real test_folder and the
+# real baseline.json are never touched.
+#
+# Install requirement (testing only - the tool itself needs nothing):
+#     python -m pip install pytest
+
+import json
+
+import pytest  # noqa: E402  (imported here next to the Week 2 tests)
+
+
+# ---------------------------------------------------------------------------
+# Week 2 helpers
+# ---------------------------------------------------------------------------
+
+def _make_folder(root, files):
+    """Create files inside ``root``; keys may contain sub-folders."""
+    for name, content in files.items():
+        target = Path(root) / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, str):
+            target.write_bytes(content.encode("utf-8"))
+        else:
+            target.write_bytes(content)
+    return Path(root)
+
+
+def _quiet(func, *args, **kwargs):
+    """Call ``func`` while swallowing its console output; return its result."""
+    with contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(io.StringIO()):
+        return func(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# 1. Creating a baseline
+# ---------------------------------------------------------------------------
+
+def test_pytest_create_baseline_writes_readable_json(tmp_path):
+    """Test 1: `baseline` writes baseline.json with hashes, size and mtime."""
+    folder = _make_folder(tmp_path / "test_folder", {
+        "file1.txt": "Alpha sample document.\n",
+        "file2.txt": "Bravo sample document.\n",
+    })
+    baseline_path = tmp_path / "baseline.json"
+
+    exit_code = _quiet(main.command_baseline, folder, baseline_path=baseline_path)
+
+    assert exit_code == main.EXIT_OK
+    assert baseline_path.is_file()
+
+    raw_text = baseline_path.read_text(encoding="utf-8")
+    assert "\n  " in raw_text, "JSON should be indented, not one long line"
+
+    data = json.loads(raw_text)
+    assert data["algorithm"] == "sha256"
+    assert data["file_count"] == 2
+    assert data["schema_version"] == main.BASELINE_SCHEMA_VERSION
+
+    files = data["files"]
+    assert set(files) == {"file1.txt", "file2.txt"}
+    for name, entry in files.items():
+        expected = hashlib.sha256((folder / name).read_bytes()).hexdigest()
+        assert entry["sha256"] == expected
+        assert entry["size"] == (folder / name).stat().st_size
+        assert isinstance(entry["mtime"], float)
+
+
+def test_pytest_build_snapshot_returns_hashes_keyed_by_relative_path(tmp_path):
+    """build_snapshot() maps relative paths -> {hash, size, mtime}."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "hello\n"})
+
+    snapshot = _quiet(main.build_snapshot, folder)
+
+    assert snapshot["file1.txt"]["sha256"] == hashlib.sha256(b"hello\n").hexdigest()
+    assert snapshot["file1.txt"]["size"] == 6
+    assert "mtime" in snapshot["file1.txt"]
+
+
+# ---------------------------------------------------------------------------
+# 2-5. The four comparison categories
+# ---------------------------------------------------------------------------
+
+def test_pytest_detects_added_file(tmp_path):
+    """Test 2: a new file is reported as ADDED."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+    baseline_path = tmp_path / "baseline.json"
+    _quiet(main.command_baseline, folder, baseline_path=baseline_path)
+
+    (folder / "brand_new.txt").write_bytes(b"surprise\n")
+
+    exit_code = _quiet(main.command_check, folder, baseline_path=baseline_path)
+    result = _quiet(main.compare_snapshots,
+                    _quiet(main.load_baseline, baseline_path),
+                    _quiet(main.build_snapshot, folder))
+
+    assert exit_code == main.EXIT_CHANGES
+    assert result["added"] == ["brand_new.txt"]
+    assert result["modified"] == []
+    assert result["deleted"] == []
+    assert result["unchanged"] == ["file1.txt"]
+
+
+def test_pytest_detects_modified_file(tmp_path):
+    """Test 3: changed content is reported as MODIFIED with both hashes."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "original\n"})
+    baseline_path = tmp_path / "baseline.json"
+    _quiet(main.command_baseline, folder, baseline_path=baseline_path)
+
+    (folder / "file1.txt").write_bytes(b"original but tampered\n")
+
+    baseline = _quiet(main.load_baseline, baseline_path)
+    current = _quiet(main.build_snapshot, folder)
+    result = _quiet(main.compare_snapshots, baseline, current)
+
+    assert result["modified"] == ["file1.txt"]
+    assert result["added"] == [] and result["deleted"] == []
+    assert main.get_hash(baseline["file1.txt"]) != main.get_hash(current["file1.txt"])
+
+
+def test_pytest_detects_deleted_file(tmp_path):
+    """Test 4: a removed file is reported as DELETED."""
+    folder = _make_folder(tmp_path / "test_folder", {
+        "file1.txt": "one\n",
+        "file2.txt": "two\n",
+    })
+    baseline_path = tmp_path / "baseline.json"
+    _quiet(main.command_baseline, folder, baseline_path=baseline_path)
+
+    (folder / "file2.txt").unlink()
+
+    exit_code = _quiet(main.command_check, folder, baseline_path=baseline_path)
+    result = _quiet(main.compare_snapshots,
+                    _quiet(main.load_baseline, baseline_path),
+                    _quiet(main.build_snapshot, folder))
+
+    assert exit_code == main.EXIT_CHANGES
+    assert result["deleted"] == ["file2.txt"]
+    assert result["unchanged"] == ["file1.txt"]
+
+
+def test_pytest_reports_no_changes_when_folder_unchanged(tmp_path, capsys):
+    """Test 5: an untouched folder prints the exact 'no changes' sentence."""
+    folder = _make_folder(tmp_path / "test_folder", {
+        "file1.txt": "one\n",
+        "file2.txt": "two\n",
+    })
+    baseline_path = tmp_path / "baseline.json"
+    _quiet(main.command_baseline, folder, baseline_path=baseline_path)
+
+    exit_code = main.command_check(folder, baseline_path=baseline_path)
+    captured = capsys.readouterr().out
+
+    assert exit_code == main.EXIT_OK
+    assert "No changes detected. Folder integrity verified." in captured
+    assert "ADDED files (0)" in captured
+    assert "UNCHANGED files (2)" in captured
+
+
+def test_pytest_no_changes_detected_by_comparison(tmp_path):
+    """has_changes() is False for two identical snapshots."""
+    folder = _make_folder(tmp_path / "test_folder", {"a.txt": "a\n", "b.txt": "b\n"})
+    snapshot = _quiet(main.build_snapshot, folder)
+
+    result = _quiet(main.compare_snapshots, snapshot, dict(snapshot))
+
+    assert not main.has_changes(result)
+    assert result["unchanged"] == ["a.txt", "b.txt"]
+
+
+# ---------------------------------------------------------------------------
+# 6. Sub-folder support
+# ---------------------------------------------------------------------------
+
+def test_pytest_detects_files_inside_subfolders(tmp_path):
+    """Test 6: the walk is recursive, including deeply nested files."""
+    folder = _make_folder(tmp_path / "test_folder", {
+        "file1.txt": "top level\n",
+        "subfolder/file3.txt": "one level down\n",
+        "subfolder/deeper/file4.txt": "two levels down\n",
+    })
+
+    snapshot = _quiet(main.build_snapshot, folder)
+
+    assert "file1.txt" in snapshot
+    assert "subfolder/file3.txt" in snapshot
+    assert "subfolder/deeper/file4.txt" in snapshot
+    assert len(snapshot) == 3
+
+
+def test_pytest_detects_changes_inside_subfolders(tmp_path):
+    """Added, modified and deleted files in sub-folders are all detected."""
+    folder = _make_folder(tmp_path / "test_folder", {
+        "subfolder/file3.txt": "one\n",
+        "subfolder/file4.txt": "two\n",
+        "subfolder/deeper/file5.txt": "three\n",
+    })
+    baseline_path = tmp_path / "baseline.json"
+    _quiet(main.command_baseline, folder, baseline_path=baseline_path)
+
+    (folder / "subfolder" / "file3.txt").write_bytes(b"one, but changed\n")
+    (folder / "subfolder" / "file4.txt").unlink()
+    (folder / "subfolder" / "deeper" / "brand_new.txt").write_bytes(b"new\n")
+
+    result = _quiet(main.compare_snapshots,
+                    _quiet(main.load_baseline, baseline_path),
+                    _quiet(main.build_snapshot, folder))
+
+    assert result["added"] == ["subfolder/deeper/brand_new.txt"]
+    assert result["modified"] == ["subfolder/file3.txt"]
+    assert result["deleted"] == ["subfolder/file4.txt"]
+    assert result["unchanged"] == ["subfolder/deeper/file5.txt"]
+
+
+# ---------------------------------------------------------------------------
+# 7-8. Baseline problems
+# ---------------------------------------------------------------------------
+
+def test_pytest_missing_baseline_is_handled(tmp_path, capsys):
+    """Test 7: a missing baseline gives a helpful error and exit code 1."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+    baseline_path = tmp_path / "does_not_exist.json"
+
+    exit_code = main.command_check(folder, baseline_path=baseline_path)
+    captured = capsys.readouterr()
+
+    assert exit_code == main.EXIT_FAILURE
+    assert "No baseline found" in captured.err
+    assert "python main.py baseline" in captured.err
+    assert not baseline_path.exists(), "check must never create a baseline"
+    assert _quiet(main.load_baseline, baseline_path) is None
+
+
+def test_pytest_invalid_json_is_handled_and_not_overwritten(tmp_path, capsys):
+    """Test 8: invalid JSON is reported and the file is left untouched."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+    baseline_path = tmp_path / "baseline.json"
+    broken_content = '{ "files": { "file1.txt": '   # deliberately truncated
+    baseline_path.write_text(broken_content, encoding="utf-8")
+
+    exit_code = main.command_check(folder, baseline_path=baseline_path)
+    captured = capsys.readouterr()
+
+    assert exit_code == main.EXIT_FAILURE
+    assert "not valid JSON" in captured.err
+    assert baseline_path.read_text(encoding="utf-8") == broken_content
+
+
+def test_pytest_wrong_baseline_structure_is_handled(tmp_path, capsys):
+    """A JSON array (or a non-object 'files' value) is rejected cleanly."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+
+    array_baseline = tmp_path / "array.json"
+    array_baseline.write_text("[1, 2, 3]", encoding="utf-8")
+    assert main.command_check(folder, baseline_path=array_baseline) == main.EXIT_FAILURE
+    assert "unexpected structure" in capsys.readouterr().err
+
+    bad_files = tmp_path / "bad_files.json"
+    bad_files.write_text('{"files": "not-an-object"}', encoding="utf-8")
+    assert main.command_check(folder, baseline_path=bad_files) == main.EXIT_FAILURE
+
+
+def test_pytest_baseline_command_rejects_missing_folder(tmp_path):
+    """`baseline` fails cleanly when the monitored folder does not exist."""
+    missing = tmp_path / "no_such_folder"
+
+    exit_code = _quiet(main.command_baseline, missing,
+                       baseline_path=tmp_path / "baseline.json")
+
+    assert exit_code == main.EXIT_FAILURE
+    assert not (tmp_path / "baseline.json").exists()
+
+
+def test_pytest_baseline_update_reports_updated(tmp_path, capsys):
+    """Running `baseline` twice updates (not duplicates) the file."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+    baseline_path = tmp_path / "baseline.json"
+
+    _quiet(main.command_baseline, folder, baseline_path=baseline_path)
+    (folder / "file2.txt").write_bytes(b"two\n")
+    main.command_baseline(folder, baseline_path=baseline_path)
+    captured = capsys.readouterr().out
+
+    assert "Baseline updated: 2 file(s)" in captured
+    assert json.loads(baseline_path.read_text())["file_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# 9. Relative paths
+# ---------------------------------------------------------------------------
+
+def test_pytest_baseline_stores_relative_paths_only(tmp_path):
+    """Test 9: no absolute paths are stored, and keys use forward slashes."""
+    folder = _make_folder(tmp_path / "test_folder", {
+        "file1.txt": "top\n",
+        "subfolder/file2.txt": "nested\n",
+    })
+    baseline_path = tmp_path / "baseline.json"
+    _quiet(main.command_baseline, folder, baseline_path=baseline_path)
+
+    keys = list(json.loads(baseline_path.read_text())["files"])
+    assert keys == ["file1.txt", "subfolder/file2.txt"]
+
+    for key in keys:
+        assert not key.startswith("/"), "keys must never be absolute"
+        assert ":" not in key, "no Windows drive letters in keys"
+        assert str(tmp_path) not in key
+        assert not Path(key).is_absolute()
+
+
+def test_pytest_relative_keys_survive_folder_move(tmp_path):
+    """A baseline still matches after the project folder is moved."""
+    folder = _make_folder(tmp_path / "original" / "test_folder", {
+        "file1.txt": "content\n",
+        "subfolder/file2.txt": "nested\n",
+    })
+    baseline_path = tmp_path / "baseline.json"
+    _quiet(main.command_baseline, folder, baseline_path=baseline_path)
+
+    moved = tmp_path / "moved_elsewhere" / "test_folder"
+    moved.parent.mkdir(parents=True)
+    folder.rename(moved)
+
+    result = _quiet(main.compare_snapshots,
+                    _quiet(main.load_baseline, baseline_path),
+                    _quiet(main.build_snapshot, moved))
+
+    assert not main.has_changes(result)
+    assert result["unchanged"] == ["file1.txt", "subfolder/file2.txt"]
+
+
+# ---------------------------------------------------------------------------
+# 10. Size / mtime metadata (stretch goal)
+# ---------------------------------------------------------------------------
+
+def test_pytest_metadata_records_size_and_mtime(tmp_path):
+    """Test 10: size in bytes and mtime are recorded per file."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "0123456789"})
+
+    entry = _quiet(main.build_snapshot, folder)["file1.txt"]
+
+    assert entry["size"] == 10
+    assert entry["mtime"] == pytest.approx((folder / "file1.txt").stat().st_mtime)
+    assert entry["size"] == (folder / "file1.txt").stat().st_size
+
+
+def test_pytest_timestamp_change_alone_is_not_a_modification(tmp_path):
+    """A touched file (new mtime, same content) stays UNCHANGED.
+
+    This is the key rule: SHA-256 decides, metadata is informational only.
+    """
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "stable content\n"})
+    baseline_path = tmp_path / "baseline.json"
+    _quiet(main.command_baseline, folder, baseline_path=baseline_path)
+
+    # Rewrite the identical bytes and push the mtime two hours into the future.
+    target = folder / "file1.txt"
+    original_bytes = target.read_bytes()
+    target.write_bytes(original_bytes)
+    new_mtime = target.stat().st_mtime + 7200
+    os.utime(target, (new_mtime, new_mtime))
+
+    baseline = _quiet(main.load_baseline, baseline_path)
+    current = _quiet(main.build_snapshot, folder)
+    result = _quiet(main.compare_snapshots, baseline, current)
+
+    assert current["file1.txt"]["mtime"] != baseline["file1.txt"]["mtime"]
+    assert current["file1.txt"]["size"] == baseline["file1.txt"]["size"]
+    assert result["modified"] == []
+    assert result["unchanged"] == ["file1.txt"]
+    assert not main.has_changes(result)
+
+
+def test_pytest_metadata_helpers_format_output(tmp_path):
+    """_human_size() and _format_mtime() produce readable strings."""
+    assert main._human_size(0) == "0 B"
+    assert main._human_size(999) == "999 B"
+    assert main._human_size(2048) == "2.0 KiB"
+    assert main._human_size(None) == "unknown size"
+    assert main._format_mtime(None) == "unknown mtime"
+    assert len(main._format_mtime(0)) == 19  # YYYY-MM-DD HH:MM:SS
+
+
+# ---------------------------------------------------------------------------
+# Safety: boundaries, symlinks, CLI wiring
+# ---------------------------------------------------------------------------
+
+def test_pytest_no_symlinks_are_followed(tmp_path):
+    """Symbolic links are skipped, including links pointing outside the folder."""
+    folder = _make_folder(tmp_path / "test_folder", {"real.txt": "real\n"})
+    outside = tmp_path / "outside_secret.txt"
+    outside.write_bytes(b"must never be hashed\n")
+
+    try:
+        (folder / "link.txt").symlink_to(outside)
+        (folder / "link_dir").symlink_to(tmp_path)
+    except (OSError, NotImplementedError) as exc:  # pragma: no cover
+        pytest.skip(f"cannot create symlinks here: {exc}")
+
+    snapshot = _quiet(main.build_snapshot, folder)
+
+    assert list(snapshot) == ["real.txt"]
+    hashes = [main.get_hash(entry) for entry in snapshot.values()]
+    assert hashlib.sha256(b"must never be hashed\n").hexdigest() not in hashes
+
+
+def test_pytest_demo_copies_are_excluded_from_baseline(tmp_path):
+    """A leftover demo_copy_* file is never recorded in the baseline."""
+    folder = _make_folder(tmp_path / "test_folder", {
+        "file1.txt": "real\n",
+        f"{main.DEMO_PREFIX}file1_999.txt": "temporary\n",
+    })
+
+    snapshot = _quiet(main.build_snapshot, folder)
+
+    assert list(snapshot) == ["file1.txt"]
+
+
+def test_pytest_unreadable_file_does_not_break_baseline(tmp_path):
+    """An unreadable file is skipped; the rest of the snapshot still works."""
+    folder = _make_folder(tmp_path / "test_folder", {
+        "good.txt": "readable\n",
+        "bad.txt": "unreadable\n",
+    })
+    real_open = builtins.open
+
+    def selective_open(file, mode="r", *args, **kwargs):
+        if Path(file).name == "bad.txt":
+            raise PermissionError(13, "Permission denied")
+        return real_open(file, mode, *args, **kwargs)
+
+    with mock.patch("builtins.open", side_effect=selective_open):
+        snapshot = _quiet(main.build_snapshot, folder)
+
+    assert list(snapshot) == ["good.txt"]
+
+
+def test_pytest_cli_baseline_and_check_end_to_end(tmp_path, capsys):
+    """The argparse layer wires `baseline` and `check` to the right functions."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+    baseline_path = tmp_path / "cli_baseline.json"
+
+    assert main.main(["--folder", str(folder), "--baseline", str(baseline_path),
+                      "baseline"]) == main.EXIT_OK
+    assert baseline_path.is_file()
+
+    assert main.main(["--folder", str(folder), "--baseline", str(baseline_path),
+                      "check"]) == main.EXIT_OK
+
+    (folder / "file2.txt").write_bytes(b"two\n")
+    assert main.main(["--folder", str(folder), "--baseline", str(baseline_path),
+                      "check"]) == main.EXIT_CHANGES
+    assert "ADDED files (1)" in capsys.readouterr().out
+
+
+def test_pytest_cli_default_command_is_still_week1_scan(tmp_path, capsys):
+    """`python main.py` (no command) keeps the Week 1 scanning behaviour."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+
+    exit_code = main.main(["--folder", str(folder)])
+    captured = capsys.readouterr().out
+
+    assert exit_code == main.EXIT_OK
+    assert "SHA-256 FILE INTEGRITY CHECKER" in captured
+    assert hashlib.sha256(b"one\n").hexdigest() in captured
+
+
+def test_pytest_cli_rejects_unknown_command(tmp_path):
+    """An unknown command is an argparse usage error (exit code 2)."""
+    with contextlib.redirect_stderr(io.StringIO()):
+        with pytest.raises(SystemExit) as excinfo:
+            main.parse_args(["frobnicate"])
+    assert excinfo.value.code == 2
+
+
+def test_pytest_cli_sha1_baseline_and_check(tmp_path):
+    """SHA-1 still works end to end for baseline + check."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+    baseline_path = tmp_path / "sha1.json"
+
+    _quiet(main.command_baseline, folder, baseline_path=baseline_path,
+           algorithm="sha1")
+    stored = json.loads(baseline_path.read_text())["files"]["file1.txt"]["sha1"]
+    assert stored == hashlib.sha1(b"one\n").hexdigest()
+    assert len(stored) == 40
+
+    assert _quiet(main.command_check, folder, baseline_path=baseline_path,
+                  algorithm="sha1") == main.EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# Week 2 integration test against the shipped project folder
+# ---------------------------------------------------------------------------
+
+def test_pytest_shipped_baseline_matches_shipped_test_folder():
+    """The committed baseline.json must match the shipped sample files."""
+    project_root = Path(__file__).resolve().parent
+    baseline_path = project_root / main.BASELINE_FILENAME
+    if not baseline_path.is_file():
+        pytest.skip("baseline.json is not shipped with this copy")
+
+    result = _quiet(main.compare_snapshots,
+                    _quiet(main.load_baseline, baseline_path),
+                    _quiet(main.build_snapshot, project_root / "test_folder"))
+
+    assert not main.has_changes(result), (
+        f"shipped baseline is stale: added={result['added']} "
+        f"modified={result['modified']} deleted={result['deleted']}"
+    )
+    assert result["unchanged"], "expected the sample files to be covered"
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

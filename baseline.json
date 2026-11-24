@@ -1,0 +1,70 @@
+{
+  "tool": "FileWatch - File Integrity Monitor",
+  "schema_version": 2,
+  "algorithm": "sha256",
+  "folder": "test_folder",
+  "created_utc": "2026-11-24T16:26:42Z",
+  "file_count": 12,
+  "files": {
+    "documents/nested/deep.txt": {
+      "sha256": "12e627982f32b3827aaeefe165128bbf16b1b1208e75c266fab21332f91ce826",
+      "size": 160,
+      "mtime": 1795537507.94533
+    },
+    "documents/notes.txt": {
+      "sha256": "36838e788860dec856682898aa506bcb954832b08f48386714dd1192860af673",
+      "size": 103,
+      "mtime": 1795537507.94133
+    },
+    "file1.txt": {
+      "sha256": "ae510d7cd737086c15f672c3e47d6d801d7de14a4b6767307229ce674d039026",
+      "size": 155,
+      "mtime": 1795537435.4133298
+    },
+    "file2.txt": {
+      "sha256": "9205ab020474954eff2177c6c6b7f114c6e1aca87cf690fe4496486b9b5b3df3",
+      "size": 144,
+      "mtime": 1795537435.4133298
+    },
+    "file3.txt": {
+      "sha256": "a9c03730fc6959e3b1c7f3b23cc940f2da69d3457e147633e66bcd888aca25c8",
+      "size": 154,
+      "mtime": 1795537435.4133298
+    },
+    "file4.txt": {
+      "sha256": "e990186842d89c6d1d3d5e592661b9d99b9be123948c00ddfe5f8b93a9ac5128",
+      "size": 139,
+      "mtime": 1795537435.4133298
+    },
+    "file5.txt": {
+      "sha256": "de354fc1340c6f1e2fe404def8ef10913a1f5a5f3d471a264e0618d56f95883a",
+      "size": 123,
+      "mtime": 1795537435.4133298
+    },
+    "file6.txt": {
+      "sha256": "6c646211e6da710b673b02a0eff9360460ce9d35ce41e2671a390c4b7211dcb5",
+      "size": 151,
+      "mtime": 1795537435.4133298
+    },
+    "file7.txt": {
+      "sha256": "c55b88c3e351bcfcf0fdd1f9aea2dead82600db3f2be5ee4aaa232ba775c197e",
+      "size": 149,
+      "mtime": 1795537435.4133298
+    },
+    "file8.txt": {
+      "sha256": "f6ee68a5144a2927d26b004785d3a697a62254a646baf5d205fd98a87246b572",
+      "size": 141,
+      "mtime": 1795537435.4133298
+    },
+    "subfolder/file10.txt": {
+      "sha256": "0f4e0b1a2aa90dac5ceb8fb382499e88b5391e31ad6c5cb99faec3f2afc60b53",
+      "size": 150,
+      "mtime": 1795537507.94133
+    },
+    "subfolder/file9.txt": {
+      "sha256": "7d51b0eef6045d86114ca515c88202d7c5f21e15d81ecaef1598340570787708",
+      "size": 183,
+      "mtime": 1795537507.9373298
+    }
+  }
+}

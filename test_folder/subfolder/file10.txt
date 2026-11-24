@@ -1,0 +1,3 @@
+Juliet sample document.
+A subfolder file is monitored exactly like a file at the top level.
+Moving it here would be reported as a delete plus an add.

@@ -1,0 +1,3 @@
+India sample document, stored inside a subfolder.
+FileWatch walks recursively, so this file appears in the baseline
+as "subfolder/file9.txt" - a relative path, never an absolute one.

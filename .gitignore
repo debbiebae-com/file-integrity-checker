@@ -38,6 +38,19 @@ checksums.sha256
 baseline.txt
 current.txt
 
+# --- Week 2: baseline artifacts ---
+# baseline.json IS committed on purpose (it is the sample baseline).
+# Only the atomic-write temp file and any alternate baselines are ignored.
+baseline.json.tmp
+*.json.tmp
+other.json
+my.json
+legacy.json
+bad.json
+arr.json
+
+# --- pytest artifacts ---
+
 # --- Temporary demonstration leftovers (should never be committed) ---
 test_folder/demo_copy_*
 

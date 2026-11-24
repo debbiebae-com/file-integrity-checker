@@ -1,0 +1,3 @@
+A deeper nested sample file, two folders down.
+FileWatch reports it as "documents/nested/deep.txt" in baseline.json,
+which proves the walk really is recursive.
