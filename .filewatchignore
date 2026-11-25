@@ -1,0 +1,57 @@
+# .filewatchignore
+# =================
+# Patterns for files and folders that FileWatch must never report as changed.
+# One pattern per line. Lines starting with "#" and blank lines are ignored.
+#
+# Matching is done with fnmatch, applied to:
+#   * the full relative path   (subfolder/notes.tmp)
+#   * the file name            (notes.tmp)
+#   * any parent folder name   (__pycache__, .git, .venv)
+# so a bare folder name matches at any depth, and "*.tmp" matches everywhere.
+#
+# Limit: this is glob-style matching, not a full .gitignore implementation.
+# Negation patterns ("!keepme.txt") are NOT supported.
+
+# --- Temporary and editor files --------------------------------------------
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+
+# --- Python byte-code and caches ------------------------------------------
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# --- Virtual environments -------------------------------------------------
+.venv
+venv
+env
+ENV
+
+# --- Version control metadata --------------------------------------------
+.git
+.gitignore
+
+# --- This tool's own output ----------------------------------------------
+# (also built in, so it is ignored even without this file)
+filewatch.log
+*.log
+baseline.json.tmp
+*.json.tmp
+
+# --- Operating-system metadata -------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Log/artefact folders you may add yourself ---------------------------
+# build
+# dist
+# node_modules

@@ -39,14 +39,21 @@ Tested with Python 3.9+ on Linux, macOS and Windows.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
+import hmac
 import json
+import logging
 import os
+import secrets
 import shutil
+import signal
+import stat
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -79,6 +86,59 @@ EXIT_OK = 0            # success, integrity verified / baseline written
 EXIT_FAILURE = 1       # runtime problem: bad folder, unreadable baseline, ...
 EXIT_CHANGES = 2       # `check` found changes (useful in scripts / CI)
 EXIT_USAGE = 2         # argparse usage error (same value, by argparse design)
+EXIT_INTERRUPTED = 130 # Ctrl+C during `watch` (128 + SIGINT)
+
+# --- WEEK 3: continuous monitoring and alerts -------------------------------
+
+#: Logger name used everywhere in this module.
+LOGGER_NAME = "filewatch"
+
+#: Default log file, at the project root (next to main.py).
+LOG_FILENAME = "filewatch.log"
+
+#: Default polling interval for `watch`, in seconds.
+DEFAULT_INTERVAL = 5.0
+
+#: Lowest accepted interval. 0 is allowed on purpose: it means "start the next
+#: scan immediately", which is what the automated tests use to stay fast and
+#: deterministic. Negative values are rejected.
+MIN_INTERVAL = 0.0
+
+#: Default ignore-configuration file, at the project root.
+IGNORE_FILENAME = ".filewatchignore"
+
+# --- WEEK 4 (stretch): HMAC-signed baselines --------------------------------
+
+#: Environment variable that holds the HMAC key (hex or raw text).
+HMAC_KEY_ENV = "FILEWATCH_HMAC_KEY"
+
+#: Optional file containing the HMAC key (mode 0600, outside the monitored tree).
+HMAC_KEY_FILE_ENV = "FILEWATCH_HMAC_KEY_FILE"
+
+#: JSON key holding the signature, and the fields that are *not* signed.
+SIGNATURE_KEY = "signature"
+HMAC_ALGORITHM = "sha256"
+
+#: Minimum key length in bytes. RFC 2104 / current guidance: at least the
+#: output length of the hash, i.e. 32 bytes for HMAC-SHA256.
+MIN_HMAC_KEY_BYTES = 32
+
+#: Refuse to read a key file that is readable by group or others.
+KEY_FILE_MAX_MODE = 0o600
+
+#: Patterns always ignored, even when no ignore file exists. These cover this
+#: tool's own output (its log file and the baseline temp file) plus Python byte
+#: caches, so the monitor never alerts about its own artifacts. Anything else -
+#: such as ``.git``, ``.venv`` or ``*.tmp`` - belongs in ``.filewatchignore``,
+#: which ships with a sensible default list.
+DEFAULT_IGNORE_PATTERNS: Tuple[str, ...] = (
+    "filewatch.log",
+    "baseline.json.tmp",
+    "*.json.tmp",
+    "__pycache__",
+    "*.pyc",
+    "*.pyo",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +451,277 @@ def demonstrate_avalanche(folder=DEFAULT_FOLDER, algorithm: str = DEFAULT_ALGORI
 
 
 # ---------------------------------------------------------------------------
+# WEEK 3: structured logging
+# ---------------------------------------------------------------------------
+
+def setup_logging(log_path=LOG_FILENAME,
+                  verbose: bool = False,
+                  console: bool = True) -> logging.Logger:
+    """Configure and return the ``filewatch`` logger.
+
+    Structure
+    ---------
+    * one :class:`logging.FileHandler` writing to ``filewatch.log`` with
+      timestamps, level names and module names,
+    * optionally one stream handler for warnings and errors on stderr.
+
+    Duplicate-handler safety
+    ------------------------
+    Calling this function more than once (a watch loop, a test, the CLI) must
+    not duplicate log lines. Every handler created here is tagged with
+    ``_filewatch_managed = True``; any managed handler already attached is
+    closed and removed first. Handlers added by the *application user* (e.g.
+    pytest's ``caplog``) are left alone.
+
+    The logger never propagates to the root logger, so importing this module in
+    another program cannot pollute that program's logging configuration.
+    """
+    logger = logging.getLogger(LOGGER_NAME)
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    logger.propagate = False
+
+    # Remove only handlers we previously installed - never foreign ones.
+    for handler in list(logger.handlers):
+        if getattr(handler, "_filewatch_managed", False):
+            logger.removeHandler(handler)
+            try:
+                handler.close()
+            except OSError:  # pragma: no cover - closing a dead file
+                pass
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    target = Path(log_path)
+    try:
+        if target.parent and str(target.parent) not in ("", "."):
+            target.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(target, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+        file_handler.setFormatter(formatter)
+        file_handler._filewatch_managed = True  # type: ignore[attr-defined]
+        logger.addHandler(file_handler)
+    except OSError as exc:
+        # Logging must never be the reason the tool fails to start.
+        print(f"  [WARNING] Could not open log file {target}: {exc}",
+              file=sys.stderr)
+        file_handler = None
+
+    if console:
+        stream_handler = logging.StreamHandler(stream=sys.stderr)
+        stream_handler.setLevel(logging.WARNING)
+        stream_handler.setFormatter(formatter)
+        stream_handler._filewatch_managed = True  # type: ignore[attr-defined]
+        logger.addHandler(stream_handler)
+
+    logger.debug("Logging initialised (log file: %s)", target)
+    return logger
+
+
+def get_logger() -> logging.Logger:
+    """Return the shared ``filewatch`` logger without reconfiguring it."""
+    return logging.getLogger(LOGGER_NAME)
+
+
+def reset_logging() -> None:
+    """Detach and close every managed handler (used by tests and shutdown)."""
+    logger = logging.getLogger(LOGGER_NAME)
+    for handler in list(logger.handlers):
+        if getattr(handler, "_filewatch_managed", False):
+            logger.removeHandler(handler)
+            try:
+                handler.close()
+            except OSError:  # pragma: no cover
+                pass
+
+
+# ---------------------------------------------------------------------------
+# WEEK 3: terminal alerts (colour where the terminal supports it)
+# ---------------------------------------------------------------------------
+
+#: ANSI escape sequences, keyed by meaning. Empty strings when colour is off.
+_COLOURS = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "blue": "\033[34m",
+    "magenta": "\033[35m",
+    "cyan": "\033[36m",
+    "grey": "\033[90m",
+}
+
+_NO_COLOURS = {key: "" for key in _COLOURS}
+
+
+def supports_colour(stream=None) -> bool:
+    """Best-effort check: is colour output appropriate for this stream?
+
+    Colour is disabled when ``NO_COLOR`` is set (see https://no-color.org),
+    when ``TERM`` is ``dumb``, and whenever the stream is not a TTY - which
+    also keeps piped output, log redirection and test capture clean.
+    """
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    if os.environ.get("TERM", "") == "dumb":
+        return False
+    stream = stream if stream is not None else sys.stdout
+    return bool(getattr(stream, "isatty", lambda: False)())
+
+
+def colour_map(enabled: bool) -> Dict[str, str]:
+    """Return the ANSI map when ``enabled``, otherwise a map of empty strings."""
+    return dict(_COLOURS) if enabled else dict(_NO_COLOURS)
+
+
+def paint(text: str, colour: str, enabled: bool = True) -> str:
+    """Wrap ``text`` in an ANSI colour when ``enabled``; otherwise return it."""
+    if not enabled:
+        return text
+    code = _COLOURS.get(colour, "")
+    if not code:
+        return text
+    return f"{code}{text}{_COLOURS['reset']}"
+
+
+# ---------------------------------------------------------------------------
+# WEEK 3: ignore configuration (.filewatchignore)
+# ---------------------------------------------------------------------------
+
+class IgnoreRules:
+    """Compiled ignore rules: comments, blank lines and ``fnmatch`` patterns.
+
+    Matching rules
+    --------------
+    A file is ignored when **any** of these match:
+
+    * ``fnmatch`` against the full relative path (``subfolder/notes.tmp``),
+    * ``fnmatch`` against the basename (``notes.tmp``),
+    * ``fnmatch`` against any parent directory name (``__pycache__``, ``.git``),
+    * equality/prefix match on a directory-style pattern (``.git`` or ``.git/``),
+    * the same three checks against each pattern's basename (so ``**/cache``
+      also matches ``a/b/cache/file.txt``).
+
+    ``*`` therefore behaves like a git-ignore "single segment" pattern and
+    ``**/x`` or a bare directory name matches at any depth, which is what people
+    expect from patterns such as ``*.tmp``, ``.git``, ``.venv`` and
+    ``__pycache__``.
+    """
+
+    def __init__(self, patterns: Optional[Iterable[str]] = None,
+                 source: Optional[Path] = None) -> None:
+        self.patterns: List[str] = []
+        self.source = source
+        self._add_patterns(patterns or ())
+
+    # -- construction ------------------------------------------------------
+    def _add_patterns(self, patterns: Iterable[str]) -> None:
+        for raw in patterns:
+            pattern = raw.strip()
+            if not pattern or pattern.startswith("#"):
+                continue  # blank line or comment
+            if pattern.startswith("./"):
+                pattern = pattern[2:]
+            pattern = pattern.rstrip("/")
+            if pattern and pattern not in self.patterns:
+                self.patterns.append(pattern)
+
+    @classmethod
+    def from_file(cls, path) -> "IgnoreRules":
+        """Load a ``.filewatchignore`` file. A missing file means "no rules"."""
+        rules = cls()
+        rules.source = Path(path)
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except (FileNotFoundError, NotADirectoryError):
+            return rules
+        except (OSError, UnicodeDecodeError) as exc:
+            get_logger().warning("Could not read ignore file %s: %s", path, exc)
+            return rules
+        rules._add_patterns(text.splitlines())
+        return rules
+
+    @classmethod
+    def default(cls) -> "IgnoreRules":
+        """Always-on internal patterns (this tool's own artifacts)."""
+        return cls(DEFAULT_IGNORE_PATTERNS)
+
+    # -- matching ----------------------------------------------------------
+    @staticmethod
+    def _pattern_matches(pattern: str, path: str, name: str,
+                         parents: Tuple[str, ...]) -> bool:
+        candidates = (path, name) + parents
+        pat_name = pattern.rsplit("/", 1)[-1]
+        for candidate in candidates:
+            if fnmatch.fnmatchcase(candidate, pattern):
+                return True
+            if pat_name != pattern and fnmatch.fnmatchcase(candidate, pat_name):
+                return True
+        return False
+
+    def is_ignored_path(self, path_parts: Iterable[str]) -> bool:
+        """True if any part of a path matches a pattern (used while walking)."""
+        parts = [part for part in path_parts if part not in ("", ".")]
+        if not parts:
+            return False
+        joined = "/".join(parts)
+        name = parts[-1]
+        parents = tuple(parts[:-1])
+        return any(self._pattern_matches(pattern, joined, name, parents)
+                   for pattern in self.patterns)
+
+    def is_ignored(self, relative_path: str) -> bool:
+        """True if a relative POSIX path (``sub/x.tmp``) is ignored."""
+        return self.is_ignored_path(str(relative_path).split("/"))
+
+    def filter_snapshot(self, snapshot: Dict[str, dict]) -> Dict[str, dict]:
+        """Return only the snapshot entries that are *not* ignored."""
+        return {key: value for key, value in snapshot.items()
+                if not self.is_ignored(key)}
+
+    def __len__(self) -> int:
+        return len(self.patterns)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"IgnoreRules({self.patterns!r})"
+
+
+def load_ignore_rules(ignore_path=None, folder=None) -> IgnoreRules:
+    """Load the default patterns plus ``.filewatchignore``.
+
+    Lookup order for the ignore file:
+
+    1. an explicit ``ignore_path`` (``--ignore``),
+    2. ``<monitored folder>/.filewatchignore``,
+    3. ``<project root>/.filewatchignore``.
+
+    The first file found wins; the always-on internal patterns are always
+    included, so the tool never alerts about its own log file.
+    """
+    rules = IgnoreRules.default()
+
+    candidates: List[Path] = []
+    if ignore_path:
+        candidates.append(Path(ignore_path))
+    else:
+        if folder is not None:
+            candidates.append(Path(folder) / IGNORE_FILENAME)
+        candidates.append(Path(__file__).resolve().parent / IGNORE_FILENAME)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            loaded = IgnoreRules.from_file(candidate)
+            rules._add_patterns(loaded.patterns)
+            rules.source = candidate
+            break
+
+    return rules
+
+
+# ---------------------------------------------------------------------------
 # WEEK 2: snapshot building (recursive, relative paths, no symlinks)
 # ---------------------------------------------------------------------------
 
@@ -408,13 +739,18 @@ def _relative_key(file_path: Path, root: Path) -> str:
     return file_path.relative_to(root).as_posix()
 
 
-def walk_regular_files(folder) -> Tuple[List[Path], List[str]]:
+def walk_regular_files(folder,
+                       ignore: Optional["IgnoreRules"] = None
+                       ) -> Tuple[List[Path], List[str]]:
     """Recursively collect regular files under ``folder``.
 
     Returns ``(files, skipped)`` where ``files`` is a list of paths and
     ``skipped`` is a list of human-readable notes about entries that were
     deliberately not hashed (symbolic links, directories, folders we were not
-    allowed to read).
+    allowed to read, ignored paths).
+
+    ``ignore`` is optional so Week 1/2 callers keep working unchanged (Week 3
+    passes the compiled :class:`IgnoreRules` from ``.filewatchignore``).
 
     Rules, in order:
 
@@ -431,37 +767,74 @@ def walk_regular_files(folder) -> Tuple[List[Path], List[str]]:
     files: List[Path] = []
     skipped: List[str] = []
 
-    for dir_path, dir_names, file_names in os.walk(root, followlinks=False):
-        current_dir = Path(dir_path)
-
-        # Prune symlinked directories *before* os.walk descends into them.
-        # (os.walk with followlinks=False already refuses to follow them; this
-        # keeps the reported "skipped" list accurate and the intent explicit.)
-        kept_dirs: List[str] = []
-        for name in sorted(dir_names):
-            candidate = current_dir / name
-            if candidate.is_symlink():
-                skipped.append(f"{_relative_key(candidate, root)} (symbolic link to a directory)")
-            else:
-                kept_dirs.append(name)
-        dir_names[:] = kept_dirs
-
-        for name in sorted(file_names):
-            candidate = current_dir / name
-            if name.startswith(DEMO_PREFIX):
-                continue  # temporary demo copy - never part of a baseline
-            if candidate.is_symlink():
-                skipped.append(f"{_relative_key(candidate, root)} (symbolic link)")
-                continue
-            if not candidate.is_file():
-                continue  # sockets, pipes, devices ...
-            files.append(candidate)
+    # os.walk is a generator: an OSError (I/O failure, a directory removed
+    # mid-walk, an unreadable mount) is raised while *iterating*, not when the
+    # generator is created. Catching it here keeps one bad tree from taking
+    # down the whole scan - the requirement is "log the error, keep going".
+    try:
+        for dir_path, dir_names, file_names in os.walk(root, followlinks=False):
+            _collect_from_dir(Path(dir_path), root, dir_names, file_names,
+                              ignore, files, skipped)
+    except (PermissionError, OSError) as exc:
+        message = f"Could not walk {root}: {exc}"
+        skipped.append(message)
+        get_logger().error("%s - keeping the files collected so far", message)
 
     files.sort(key=lambda item: _relative_key(item, root).lower())
     return files, skipped
 
 
-def build_snapshot(folder, algorithm: str = DEFAULT_ALGORITHM) -> Dict[str, dict]:
+def _collect_from_dir(current_dir: Path, root: Path, dir_names: List[str],
+                      file_names: List[str], ignore: Optional["IgnoreRules"],
+                      files: List[Path], skipped: List[str]) -> None:
+    """Handle one directory yielded by ``os.walk``.
+
+    Prunes symlinked and ignored sub-directories by mutating ``dir_names`` in
+    place, so the walk never descends into them, and appends the regular files
+    that survive the ignore rules.
+    """
+    # Prune symlinked *and ignored* directories before os.walk descends into
+    # them. Pruning ignored directories early is what keeps scans cheap: an
+    # ignored `.git` or `.venv` tree is never entered at all.
+    kept_dirs: List[str] = []
+    for name in sorted(dir_names):
+        candidate = current_dir / name
+        relative = _relative_key(candidate, root)
+        try:
+            is_link = candidate.is_symlink()
+        except OSError:
+            continue  # metadata unreadable - do not descend
+        if is_link:
+            skipped.append(f"{relative} (symbolic link to a directory)")
+        elif ignore is not None and ignore.is_ignored(relative):
+            skipped.append(f"{relative}/ (ignored)")
+        else:
+            kept_dirs.append(name)
+    dir_names[:] = kept_dirs
+
+    for name in sorted(file_names):
+        candidate = current_dir / name
+        relative = _relative_key(candidate, root)
+        if name.startswith(DEMO_PREFIX):
+            continue  # temporary demo copy - never part of a baseline
+        if ignore is not None and ignore.is_ignored(relative):
+            continue  # ignored by .filewatchignore - never reported or alerted
+        try:
+            if candidate.is_symlink():
+                skipped.append(f"{relative} (symbolic link)")
+                continue
+            if not candidate.is_file():
+                continue  # sockets, pipes, devices ...
+        except OSError as exc:
+            skipped.append(f"{relative} (metadata unreadable: {exc})")
+            continue
+        files.append(candidate)
+
+
+def build_snapshot(folder, algorithm: str = DEFAULT_ALGORITHM,
+                   ignore: Optional["IgnoreRules"] = None,
+                   unreadable: Optional[Set[str]] = None,
+                   report_skipped: bool = True) -> Dict[str, dict]:
     """Build a snapshot of every regular file under ``folder``.
 
     Walks the folder **recursively** (sub-folders included), hashes each regular
@@ -478,15 +851,30 @@ def build_snapshot(folder, algorithm: str = DEFAULT_ALGORITHM) -> Dict[str, dict
 
     Files that cannot be read (permissions, I/O errors) are reported and
     omitted from the snapshot rather than aborting the whole run.
+
+    ``ignore`` (optional) drops paths matching ``.filewatchignore``.
+    ``unreadable`` (optional) is a set the caller provides; the relative paths
+    of files that could not be hashed are added to it so callers can tell
+    "missing" apart from "unreadable".
+
+    ``report_skipped`` controls the ``[SKIPPED]`` console notes. ``watch`` sets
+    it to ``False`` because the same notes would otherwise repeat on every
+    scan; they still go to the log file at DEBUG level.
     """
     root = Path(folder)
-    files, skipped = walk_regular_files(root)
+    files, skipped = walk_regular_files(root, ignore=ignore)
     snapshot: Dict[str, dict] = {}
 
     for file_path in files:
         digest = hash_file(file_path, algorithm=algorithm)
         if digest is None:
             # hash_file() already printed a specific [ERROR] line.
+            if unreadable is not None:
+                # Week 3: tell the caller *which* files failed, so `watch` can
+                # avoid reporting them as deleted.
+                unreadable.add(_relative_key(file_path, root))
+            get_logger().error("Could not read/hash %s - skipped in this scan",
+                               _relative_key(file_path, root))
             continue
 
         entry = {algorithm: digest}
@@ -501,8 +889,11 @@ def build_snapshot(folder, algorithm: str = DEFAULT_ALGORITHM) -> Dict[str, dict
         snapshot[_relative_key(file_path, root)] = entry
 
     if skipped:
+        logger = get_logger()
         for note in skipped:
-            print(f"  [SKIPPED] {note}", file=sys.stderr)
+            logger.debug("Skipped entry: %s", note)
+            if report_skipped:
+                print(f"  [SKIPPED] {note}", file=sys.stderr)
 
     return snapshot
 
@@ -526,7 +917,9 @@ def get_hash(entry: dict, algorithm: str = DEFAULT_ALGORITHM) -> Optional[str]:
 
 def compare_snapshots(baseline: Dict[str, dict],
                       current: Dict[str, dict],
-                      algorithm: str = DEFAULT_ALGORITHM) -> Dict[str, list]:
+                      algorithm: str = DEFAULT_ALGORITHM,
+                      unreadable: Optional[Iterable[str]] = None,
+                      root: Optional[Path] = None) -> Dict[str, list]:
     """Compare two snapshots and classify every difference.
 
     Pure dictionary/set arithmetic - no I/O - which makes it trivial to test:
@@ -537,18 +930,39 @@ def compare_snapshots(baseline: Dict[str, dict],
         modified  = common keys whose digest differs
         unchanged = common keys whose digest is identical
 
-    Returns a dictionary with the five lists (sorted for stable output):
-    ``added``, ``modified``, ``deleted``, ``unchanged`` and ``skipped``
-    (files present in both but lacking a digest for the chosen algorithm).
+    Returns a dictionary with the six lists (sorted for stable output):
+    ``added``, ``modified``, ``deleted``, ``unchanged``, ``skipped`` (files in
+    both but lacking a digest for the chosen algorithm) and ``unreadable``.
 
     A file is MODIFIED only when its content hash changed. A new timestamp or
     size with an identical hash is *not* a modification.
+
+    Week 3 - no false deletions
+    ---------------------------
+    ``unreadable`` lists relative paths that are present on disk but could not
+    be hashed (permissions, I/O errors). Such a file must never be reported as
+    DELETED just because it is missing from ``current``: the tool cannot prove
+    it is gone. Those paths land in the ``unreadable`` bucket instead, and -
+    when ``root`` is given - a final ``os.path.lexists()`` check decides:
+
+    * the path really is gone            -> genuine DELETED,
+    * the path is still there            -> kept in ``unreadable`` (no alert).
+
+    With ``unreadable=None`` (the Week 1/2 call signature) the behaviour is
+    byte-for-byte what it was before.
     """
     baseline_keys = set(baseline)
     current_keys = set(current)
+    unreadable_set = set(unreadable or ())
 
     added_files = current_keys - baseline_keys
-    deleted_files = baseline_keys - current_keys
+
+    # Candidates for "deleted": absent from the snapshot ...
+    deleted_candidates = baseline_keys - current_keys
+    # ... but only report the ones we never failed to read.
+    deleted_files = deleted_candidates - unreadable_set
+    protected_files = deleted_candidates & unreadable_set
+
     common_files = current_keys & baseline_keys
 
     modified_files: List[str] = []
@@ -567,12 +981,31 @@ def compare_snapshots(baseline: Dict[str, dict],
         else:
             unchanged_files.append(name)
 
+    # Second safety net: an unreadable path is only a genuine deletion if it is
+    # definitely not on disk any more. `lexists` is True for broken symlinks
+    # too, which is what we want here: "something is still there".
+    still_unreadable: List[str] = []
+    if root is not None:
+        root_path = Path(root)
+        for name in sorted(protected_files):
+            try:
+                exists = os.path.lexists(root_path / name)
+            except OSError:  # pragma: no cover - defensive
+                exists = True
+            if exists:
+                still_unreadable.append(name)
+            else:
+                deleted_files.add(name)
+    else:
+        still_unreadable = sorted(protected_files)
+
     return {
         "added": sorted(added_files),
         "modified": modified_files,
         "deleted": sorted(deleted_files),
         "unchanged": unchanged_files,
         "skipped": sorted(skipped_files),
+        "unreadable": sorted(still_unreadable),
     }
 
 
@@ -580,6 +1013,194 @@ def has_changes(result: Dict[str, list]) -> bool:
     """True if the comparison found any added, modified or deleted file."""
     return bool(result["added"] or result["modified"] or result["deleted"])
 
+
+# ---------------------------------------------------------------------------
+# WEEK 4 (stretch): HMAC baseline signing
+# ---------------------------------------------------------------------------
+#
+# Why: a hash baseline proves *file* integrity, but it is itself just a file.
+# Anyone who can edit a monitored file can also edit baseline.json to match.
+# An HMAC signature binds the baseline to a secret key, so tampering with the
+# baseline is detectable without the key.
+#
+# What it does NOT do: it does not protect against an attacker who already has
+# the key or who can run code as your user (they can just re-sign). It also
+# does not stop deletions inside the monitored folder. It closes exactly one
+# gap: "someone quietly rewrote the baseline".
+#
+# Key handling rules enforced here (see README section on key management):
+#   * the key is NEVER hardcoded and never written into the project folder,
+#   * it comes from the environment or a 0600 file outside the project,
+#   * it must be >= 32 bytes for HMAC-SHA256,
+#   * comparisons use hmac.compare_digest() (constant time),
+#   * failures are reported as "cannot verify", never ignored silently.
+
+class BaselineSignatureError(Exception):
+    """Raised when a baseline cannot be signed or verified safely."""
+
+
+def _looks_like_hex(text: str) -> bool:
+    """True for an even-length, non-empty string of hex digits."""
+    if not text or len(text) % 2 != 0:
+        return False
+    return all(char in "0123456789abcdefABCDEF" for char in text)
+
+
+def resolve_hmac_key(required: bool = True,
+                     key: Optional[bytes] = None,
+                     key_file=None) -> Optional[bytes]:
+    """Load the HMAC key from (1) an explicit value, (2) an explicit file,
+    (3) ``$FILEWATCH_HMAC_KEY_FILE``, (4) ``$FILEWATCH_HMAC_KEY``.
+
+    Encoding of the environment variable
+    ------------------------------------
+    * an even-length hex string is decoded as hex
+      (``export FILEWATCH_HMAC_KEY=$(openssl rand -hex 32)``),
+    * anything else is used as raw UTF-8 bytes.
+
+    A key file must not be group/world readable (mode ``0600`` expected);
+    otherwise the key is treated as compromised and rejected.
+
+    Returns ``None`` when no key is configured and ``required`` is False.
+    Raises :class:`BaselineSignatureError` when a key is needed but missing or
+    too short - signing must never silently fall back to "unsigned".
+    """
+    if key is not None:
+        material = key
+    else:
+        # An explicit path wins over the environment variable.
+        path = key_file or os.environ.get(HMAC_KEY_FILE_ENV)
+        if path:
+            candidate = Path(path)
+            try:
+                # A key stored inside the project is one `git add .` away from
+                # being published. Warn loudly; do not refuse, since a private
+                # repo may be an acceptable trade-off for the user.
+                project_root = Path(__file__).resolve().parent
+                if candidate.resolve().parent == project_root or \
+                        project_root in candidate.resolve().parents:
+                    print(f"  [WARNING] Key file {candidate} lives inside the "
+                          f"project folder - keep it outside and out of Git.",
+                          file=sys.stderr)
+            except OSError:
+                pass
+            try:
+                # Refuse a key file that other users can read.
+                mode = stat.S_IMODE(candidate.stat().st_mode)
+                if mode & 0o077:
+                    raise BaselineSignatureError(
+                        f"Key file {candidate} is too permissive "
+                        f"(mode {oct(mode)}); run: chmod 600 {candidate}"
+                    )
+                text = candidate.read_text(encoding="utf-8").strip()
+                # A key file written by `keygen` holds hex; accept raw bytes too.
+                material = (bytes.fromhex(text) if _looks_like_hex(text)
+                            else text.encode("utf-8"))
+            except FileNotFoundError:
+                raise BaselineSignatureError(f"Key file not found: {candidate}")
+            except PermissionError:
+                raise BaselineSignatureError(f"Cannot read key file: {candidate}")
+            except OSError as exc:
+                raise BaselineSignatureError(f"Cannot read key file {candidate}: {exc}")
+        else:
+            env_value = os.environ.get(HMAC_KEY_ENV)
+            if not env_value:
+                if not required:
+                    return None
+                raise BaselineSignatureError(
+                    f"No HMAC key configured. Set {HMAC_KEY_ENV} "
+                    f"(e.g. export {HMAC_KEY_ENV}=$(python -c "
+                    f"'import secrets;print(secrets.token_hex(32))')) "
+                    f"or point {HMAC_KEY_FILE_ENV} at a 0600 key file."
+                )
+            material = (bytes.fromhex(env_value)
+                        if _looks_like_hex(env_value) else env_value.encode("utf-8"))
+
+    if len(material) < MIN_HMAC_KEY_BYTES:
+        raise BaselineSignatureError(
+            f"HMAC key is too short ({len(material)} bytes). "
+            f"Use at least {MIN_HMAC_KEY_BYTES} random bytes."
+        )
+    return material
+
+
+def generate_hmac_key(num_bytes: int = MIN_HMAC_KEY_BYTES) -> str:
+    """Return a fresh cryptographically random hex key (``secrets`` module)."""
+    return secrets.token_hex(max(num_bytes, MIN_HMAC_KEY_BYTES))
+
+
+def baseline_signing_payload(metadata: Dict[str, object]) -> bytes:
+    """Serialise the signed part of a baseline deterministically.
+
+    ``signature`` is excluded (obviously) and ``signed_fields`` is excluded too
+    - it only records *which* fields were covered, so it cannot include itself.
+
+    ``sort_keys=True`` and fixed separators make the byte sequence independent
+    of dictionary ordering, so a pretty-printed, reordered or reformatted JSON
+    file still verifies as long as the *values* are unchanged.
+    """
+    signed = {key: value for key, value in metadata.items()
+              if key not in (SIGNATURE_KEY, "signed_fields")}
+    return json.dumps(signed, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+
+
+def compute_baseline_signature(metadata: Dict[str, object], key: bytes) -> str:
+    """Return the hex HMAC-SHA256 of the baseline metadata."""
+    if not key:
+        raise BaselineSignatureError("Refusing to sign without a key.")
+    return hmac.new(key, baseline_signing_payload(metadata),
+                    getattr(hashlib, HMAC_ALGORITHM)).hexdigest()
+
+
+def sign_baseline_payload(payload: Dict[str, object], key: bytes) -> Dict[str, object]:
+    """Return ``payload`` with a ``signature`` block added (copy, not in place)."""
+    signed = dict(payload)
+    signature = compute_baseline_signature(signed, key)
+    signed[SIGNATURE_KEY] = {
+        "algorithm": f"hmac-{HMAC_ALGORITHM}",
+        "value": signature,
+        "signed_fields": sorted(k for k in signed
+                                if k not in (SIGNATURE_KEY, "signed_fields")),
+    }
+    return signed
+
+
+def verify_baseline_signature(metadata: Dict[str, object],
+                              key: Optional[bytes]) -> Tuple[bool, str]:
+    """Check a baseline's signature. Returns ``(ok, human_readable_reason)``.
+
+    Outcomes:
+
+    * ``(False, "... unsigned ...")``      - baseline carries no signature,
+    * ``(False, "... no key ...")``        - signed, but we have no key,
+    * ``(False, "... MISMATCH ...")``      - tampered or wrong key,
+    * ``(True,  "... verified ...")``      - signature matches.
+
+    Never raises: callers decide whether a failure is fatal.
+    """
+    signature_block = metadata.get(SIGNATURE_KEY)
+
+    if not signature_block:
+        return False, ("baseline is UNSIGNED - its authenticity cannot be "
+                       "verified (re-sign it with `baseline --sign`)")
+    if not isinstance(signature_block, dict) or "value" not in signature_block:
+        return False, "baseline signature block is malformed"
+    if key is None:
+        return False, ("baseline is signed but no HMAC key is configured - "
+                       "set FILEWATCH_HMAC_KEY to verify it")
+
+    expected = str(signature_block.get("value", ""))
+    try:
+        actual = compute_baseline_signature(metadata, key)
+    except BaselineSignatureError as exc:  # pragma: no cover - defensive
+        return False, str(exc)
+
+    # Constant-time comparison: never leak how much of the digest matched.
+    if hmac.compare_digest(expected, actual):
+        return True, f"signature verified (hmac-{HMAC_ALGORITHM})"
+    return False, ("signature MISMATCH - the baseline was modified after it was "
+                   "signed, or the wrong key is being used")
 
 # ---------------------------------------------------------------------------
 # WEEK 2: baseline file I/O (JSON)
@@ -619,12 +1240,19 @@ def _resolve_baseline_path(baseline_path) -> Path:
 def save_baseline(snapshot: Dict[str, dict],
                   baseline_path=BASELINE_FILENAME,
                   folder=DEFAULT_FOLDER,
-                  algorithm: str = DEFAULT_ALGORITHM) -> Optional[Path]:
+                  algorithm: str = DEFAULT_ALGORITHM,
+                  sign: bool = False,
+                  key: Optional[bytes] = None) -> Optional[Path]:
     """Write ``snapshot`` to ``baseline.json`` as readable, indented JSON.
 
     The file is written by ``json.dump(..., indent=2)`` so it diffs cleanly in
     Git. A small header records the schema version, algorithm, monitored folder
     and creation time - handy when a baseline is read months later.
+
+    Week 4 (optional): with ``sign=True`` an ``hmac-sha256`` signature over the
+    whole metadata block is added. ``key`` may be supplied directly (used by the
+    tests); otherwise it is resolved from the environment / key file. Signing
+    fails loudly rather than writing an unsigned baseline by accident.
 
     Returns the path written, or ``None`` if it could not be written.
     """
@@ -639,6 +1267,18 @@ def save_baseline(snapshot: Dict[str, dict],
         "file_count": len(snapshot),
         FILES_KEY: dict(sorted(snapshot.items())),
     }
+
+    if sign:
+        try:
+            signing_key = resolve_hmac_key(required=True, key=key)
+            payload = sign_baseline_payload(payload, signing_key)
+        except BaselineSignatureError as exc:
+            print(f"  [ERROR] Could not sign the baseline: {exc}", file=sys.stderr)
+            print("  The baseline was NOT written (refusing to save it unsigned).",
+                  file=sys.stderr)
+            return None
+        print(f"  Signature : hmac-{HMAC_ALGORITHM} "
+              f"({payload[SIGNATURE_KEY]['value'][:16]}...)")
 
     try:
         # Write to a temporary file first, then atomically replace the target.
@@ -661,7 +1301,11 @@ def save_baseline(snapshot: Dict[str, dict],
     return target
 
 
-def load_baseline(baseline_path=BASELINE_FILENAME) -> Optional[Dict[str, dict]]:
+def load_baseline(baseline_path=BASELINE_FILENAME,
+                  verify: bool = False,
+                  key: Optional[bytes] = None,
+                  require_signature: Optional[bool] = None,
+                  allow_unsigned: bool = True) -> Optional[Dict[str, dict]]:
     """Load a baseline file and return its ``files`` mapping.
 
     Handles the realistic failure modes without crashing:
@@ -671,7 +1315,26 @@ def load_baseline(baseline_path=BASELINE_FILENAME) -> Optional[Dict[str, dict]]:
     * invalid JSON            -> message + ``None``
     * wrong overall structure -> message + ``None``
     * legacy flat baselines   -> accepted (``{"file1.txt": "abc..."}``)
+
+    Week 4 (optional) - signature verification
+    ------------------------------------------
+    With ``verify=True`` the HMAC signature is checked before the baseline is
+    trusted. Behaviour:
+
+    * valid signature                  -> loaded,
+    * signature mismatch (tampered)    -> refused, ``None``  (always fatal),
+    * signed but no key configured     -> refused, ``None``,
+    * unsigned baseline                -> loaded with a warning when
+      ``allow_unsigned`` is True (default, so existing users keep working),
+      refused when False.
+
+    ``require_signature=True`` is shorthand for ``verify=True,
+    allow_unsigned=False``. Defaults leave Week 1-3 behaviour untouched.
     """
+    if require_signature is not None:
+        verify = require_signature
+        allow_unsigned = not require_signature
+
     target = _resolve_baseline_path(baseline_path)
 
     try:
@@ -701,6 +1364,27 @@ def load_baseline(baseline_path=BASELINE_FILENAME) -> Optional[Dict[str, dict]]:
         print(f"  [ERROR] Baseline has an unexpected structure: {target}", file=sys.stderr)
         print("  Expected a JSON object at the top level.", file=sys.stderr)
         return None
+
+    if verify:
+        try:
+            verification_key = resolve_hmac_key(required=False, key=key) \
+                if data.get(SIGNATURE_KEY) else key
+        except BaselineSignatureError as exc:
+            print(f"  [ERROR] {exc}", file=sys.stderr)
+            return None
+
+        ok, reason = verify_baseline_signature(data, verification_key)
+
+        if ok:
+            print(f"  Signature : {reason}")
+        elif not data.get(SIGNATURE_KEY) and allow_unsigned:
+            print(f"  [WARNING] {reason}", file=sys.stderr)
+        else:
+            print(f"  [ERROR] Baseline signature check failed: {reason}",
+                  file=sys.stderr)
+            print("  Refusing to trust this baseline. Do not regenerate it "
+                  "until you understand why it changed.", file=sys.stderr)
+            return None
 
     files = data.get(FILES_KEY)
     if files is None:
@@ -738,10 +1422,79 @@ def baseline_metadata(baseline_path=BASELINE_FILENAME) -> Dict[str, object]:
 # WEEK 2: the two new commands
 # ---------------------------------------------------------------------------
 
+def command_keygen(output_path=None, force: bool = False) -> int:
+    """``python main.py keygen`` - create a random HMAC key, safely.
+
+    Prints the key to stdout (so it can go into a secrets manager) and, with
+    ``--out PATH``, also writes it to a file with mode ``0600``.
+
+    Refuses to overwrite an existing file unless ``--force`` is given, and
+    refuses outright to write the key inside the project folder: a key that
+    sits next to the code is one `git add .` away from being published.
+    """
+    new_key = generate_hmac_key()
+
+    print("=" * 74)
+    print("FILEWATCH - GENERATING AN HMAC KEY".center(74))
+    print("=" * 74)
+    print("Store this key OUTSIDE the project (secrets manager, password")
+    print("manager, or a 0600 file). Never commit it and never share it.")
+    print("-" * 74)
+
+    if output_path:
+        target = Path(output_path).expanduser()
+        project_root = Path(__file__).resolve().parent
+        try:
+            resolved = target.resolve()
+            if resolved.parent == project_root or project_root in resolved.parents:
+                print(f"  [ERROR] Refusing to write a key inside the project "
+                      f"folder: {target}", file=sys.stderr)
+                print("  Choose a path outside the repository, e.g. "
+                      "~/.config/filewatch/hmac.key", file=sys.stderr)
+                return EXIT_FAILURE
+        except OSError:
+            pass
+
+        if target.exists() and not force:
+            print(f"  [ERROR] {target} already exists. Use --force to overwrite.",
+                  file=sys.stderr)
+            return EXIT_FAILURE
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            # os.open with mode 0600 so the key is never world-readable,
+            # not even for a moment.
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(new_key + "\n")
+            os.chmod(target, 0o600)
+        except OSError as exc:
+            print(f"  [ERROR] Could not write key file {target}: {exc}",
+                  file=sys.stderr)
+            return EXIT_FAILURE
+
+        print(f"  Key file written: {target} (mode 0600)")
+        print(f"  Use it with: export {HMAC_KEY_FILE_ENV}={target}")
+    else:
+        print(f"  export {HMAC_KEY_ENV}={new_key}")
+
+    print("-" * 74)
+    print("Then sign your baseline:  python main.py baseline --sign")
+    print("=" * 74)
+    return EXIT_OK
+
+
 def command_baseline(folder=DEFAULT_FOLDER,
                      baseline_path=BASELINE_FILENAME,
-                     algorithm: str = DEFAULT_ALGORITHM) -> int:
+                     algorithm: str = DEFAULT_ALGORITHM,
+                     ignore_path=None,
+                     sign: bool = False,
+                     key: Optional[bytes] = None) -> int:
     """``python main.py baseline`` - create or update baseline.json.
+
+    Week 3: the same ``.filewatchignore`` rules used by ``watch`` are applied
+    here too, so an ignored file is never recorded in the baseline in the first
+    place (and therefore can never raise an alert later).
 
     Returns an exit code: ``EXIT_OK`` on success, ``EXIT_FAILURE`` if the folder
     is unusable or the file could not be written.
@@ -764,14 +1517,19 @@ def command_baseline(folder=DEFAULT_FOLDER,
         return EXIT_FAILURE
 
     existing = _resolve_baseline_path(baseline_path).exists()
-    snapshot = build_snapshot(folder_path, algorithm=algorithm)
+    ignore_rules = load_ignore_rules(ignore_path, folder=folder_path)
+    print(f"Ignore    : {len(ignore_rules)} pattern(s)"
+          + (f" from {ignore_rules.source}" if ignore_rules.source else " (built-in only)"))
+
+    snapshot = build_snapshot(folder_path, algorithm=algorithm, ignore=ignore_rules)
 
     if not snapshot:
         print("  Warning: no readable regular files were found.")
         print("  Writing an empty baseline anyway (delete it if that was a mistake).")
 
     written = save_baseline(snapshot, baseline_path=baseline_path,
-                            folder=folder_path, algorithm=algorithm)
+                            folder=folder_path, algorithm=algorithm,
+                            sign=sign, key=key)
     if written is None:
         return EXIT_FAILURE
 
@@ -788,7 +1546,11 @@ def command_baseline(folder=DEFAULT_FOLDER,
 
 def command_check(folder=DEFAULT_FOLDER,
                   baseline_path=BASELINE_FILENAME,
-                  algorithm: str = DEFAULT_ALGORITHM) -> int:
+                  algorithm: str = DEFAULT_ALGORITHM,
+                  ignore_path=None,
+                  verify_signature: bool = False,
+                  require_signature: bool = False,
+                  key: Optional[bytes] = None) -> int:
     """``python main.py check`` - compare the folder against baseline.json.
 
     Returns ``EXIT_OK`` (no changes), ``EXIT_CHANGES`` (changes found) or
@@ -812,7 +1574,9 @@ def command_check(folder=DEFAULT_FOLDER,
               file=sys.stderr)
         return EXIT_FAILURE
 
-    baseline = load_baseline(baseline_path)
+    baseline = load_baseline(baseline_path, verify=verify_signature,
+                             require_signature=True if require_signature else None,
+                             key=key)
     if baseline is None:
         return EXIT_FAILURE  # never replace the baseline during a check
 
@@ -826,8 +1590,14 @@ def command_check(folder=DEFAULT_FOLDER,
               f"You are comparing with {algorithm}; hashes are not comparable.")
     print("-" * 74)
 
-    current = build_snapshot(folder_path, algorithm=algorithm)
-    result = compare_snapshots(baseline, current, algorithm=algorithm)
+    # Week 3: identical ignore rules to `watch`/`baseline`, and the unreadable
+    # set so a file we could not read is never labelled "deleted".
+    ignore_rules = load_ignore_rules(ignore_path, folder=folder_path)
+    unreadable: Set[str] = set()
+    current = build_snapshot(folder_path, algorithm=algorithm,
+                             ignore=ignore_rules, unreadable=unreadable)
+    result = compare_snapshots(baseline, current, algorithm=algorithm,
+                               unreadable=unreadable, root=folder_path)
 
     def section(title: str, names: Iterable[str], marker: str) -> None:
         names = list(names)
@@ -873,6 +1643,9 @@ def command_check(folder=DEFAULT_FOLDER,
     section("UNCHANGED files", result["unchanged"], "[=]")
     if result["skipped"]:
         section("SKIPPED files (no comparable hash)", result["skipped"], "[?]")
+    if result.get("unreadable"):
+        section("UNREADABLE files (content unknown - NOT reported as deleted)",
+                result["unreadable"], "[!]")
 
     print()
     print("=" * 74)
@@ -889,6 +1662,332 @@ def command_check(folder=DEFAULT_FOLDER,
     print(f"All {len(result['unchanged'])} file(s) match the baseline.")
     print("=" * 74)
     return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# WEEK 3: alerts, single scan step and the continuous monitoring loop
+# ---------------------------------------------------------------------------
+
+#: Human-readable headers for each change category.
+ALERT_TITLES = {
+    "added": "ADDED",
+    "modified": "MODIFIED",
+    "deleted": "DELETED",
+}
+
+#: Colour and symbol for each change category.
+ALERT_STYLE = {
+    "added": ("green", "+"),
+    "modified": ("yellow", "~"),
+    "deleted": ("red", "-"),
+}
+
+
+def format_alerts(result: Dict[str, list],
+                  current: Optional[Dict[str, dict]] = None,
+                  baseline: Optional[Dict[str, dict]] = None,
+                  algorithm: str = DEFAULT_ALGORITHM,
+                  use_colour: bool = False) -> List[str]:
+    """Build the coloured terminal alert lines for one scan.
+
+    Returns a list of printable lines (no trailing newlines). Each changed file
+    appears on its own line with its **relative path**, so alerts are unambiguous
+    when several subfolders are monitored.
+
+    ``current``/``baseline`` are optional; when given, size and hash details are
+    appended for added and modified files.
+    """
+    lines: List[str] = []
+
+    for category in ("added", "modified", "deleted"):
+        names = list(result.get(category, []))
+        if not names:
+            continue
+
+        colour_name, symbol = ALERT_STYLE[category]
+        heading = f"[{symbol}] {ALERT_TITLES[category]} ({len(names)})"
+        lines.append("")
+        lines.append("  " + paint(heading, colour_name, use_colour))
+
+        for name in names:
+            alert = f"    {symbol} {name}"
+            lines.append("  " + paint(alert, colour_name, use_colour))
+
+            if category == "added" and current is not None:
+                entry = current.get(name, {})
+                lines.append("      " + paint(
+                    f"size: {_human_size(entry.get('size'))}  "
+                    f"mtime: {_format_mtime(entry.get('mtime'))}",
+                    "grey", use_colour))
+            elif category == "modified" and current is not None:
+                entry = current.get(name, {})
+                lines.append("      " + paint(
+                    f"sha256: {get_hash(entry, algorithm)}", "grey", use_colour))
+            elif category == "deleted" and baseline is not None:
+                entry = baseline.get(name, {})
+                lines.append("      " + paint(
+                    f"last known sha256: {get_hash(entry, algorithm)}",
+                    "grey", use_colour))
+
+    unreadable = result.get("unreadable") or []
+    if unreadable:
+        lines.append("")
+        lines.append("  " + paint(
+            f"[!] UNREADABLE ({len(unreadable)}) - not reported as deleted",
+            "magenta", use_colour))
+        for name in unreadable:
+            lines.append("  " + paint(f"    ! {name}", "magenta", use_colour))
+
+    return lines
+
+
+def print_alerts(result: Dict[str, list],
+                 current: Optional[Dict[str, dict]] = None,
+                 baseline: Optional[Dict[str, dict]] = None,
+                 algorithm: str = DEFAULT_ALGORITHM,
+                 use_colour: Optional[bool] = None) -> bool:
+    """Print the alerts for one scan. Returns True if anything was reported."""
+    if use_colour is None:
+        use_colour = supports_colour()
+
+    lines = format_alerts(result, current=current, baseline=baseline,
+                          algorithm=algorithm, use_colour=use_colour)
+    if not lines:
+        return False
+
+    header = paint("FILEWATCH ALERT", "bold", use_colour)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n{header}  {paint(stamp, 'grey', use_colour)}")
+    for line in lines:
+        print(line)
+    print()
+    return True
+
+
+def log_result(result: Dict[str, list], logger: Optional[logging.Logger] = None) -> None:
+    """Write every detected change and every scan problem to the log file."""
+    logger = logger or get_logger()
+
+    for category in ("added", "modified", "deleted"):
+        for name in result.get(category, []):
+            logger.warning("%s file: %s", category.upper(), name)
+
+    for name in result.get("unreadable", []):
+        logger.error("Unreadable file (content unknown, not reported as deleted): %s", name)
+
+    for name in result.get("skipped", []):
+        logger.debug("No comparable hash for %s (algorithm mismatch?)", name)
+
+
+def scan_once(folder,
+              baseline: Dict[str, dict],
+              algorithm: str = DEFAULT_ALGORITHM,
+              ignore: Optional[IgnoreRules] = None,
+              root: Optional[Path] = None) -> Tuple[Dict[str, dict], Dict[str, list]]:
+    """One monitoring cycle: snapshot the folder and compare it to ``baseline``.
+
+    Returns ``(current_snapshot, comparison_result)``. Errors while reading are
+    logged and never raised, so the watch loop can always continue.
+    """
+    folder_path = Path(folder)
+    root = root or folder_path
+    unreadable: Set[str] = set()
+
+    try:
+        current = build_snapshot(folder_path, algorithm=algorithm,
+                                 ignore=ignore, unreadable=unreadable,
+                                 report_skipped=False)
+    except (OSError, PermissionError) as exc:  # pragma: no cover - defensive
+        get_logger().error("Scan failed for %s: %s", folder_path, exc)
+        return {}, {"added": [], "modified": [], "deleted": [], "unchanged": [],
+                    "skipped": [], "unreadable": []}
+
+    result = compare_snapshots(baseline, current, algorithm=algorithm,
+                               unreadable=unreadable, root=root)
+    return current, result
+
+
+def advance_reference(reference: Dict[str, dict],
+                      current: Dict[str, dict],
+                      result: Dict[str, list]) -> Dict[str, dict]:
+    """Move an in-memory reference forward after changes have been alerted.
+
+    This is what stops a watch loop from repeating the *same* alert on every
+    cycle. Only the in-memory dictionary is updated - ``baseline.json`` on disk
+    is never written by ``watch``, so the approved "never silently replace a
+    baseline" rule still holds.
+
+    * ADDED files      -> added to the reference with their current entry,
+    * MODIFIED files   -> reference entry replaced by the current one,
+    * DELETED files    -> entry removed from the reference,
+    * UNREADABLE files -> left untouched (their state is still unknown).
+
+    Returns a new dictionary (the input is not mutated).
+    """
+    updated = dict(reference)
+
+    for name in result.get("added", []):
+        if name in current:
+            updated[name] = current[name]
+    for name in result.get("modified", []):
+        if name in current:
+            updated[name] = current[name]
+    for name in result.get("deleted", []):
+        updated.pop(name, None)
+
+    return updated
+
+
+def command_watch(folder=DEFAULT_FOLDER,
+                  baseline_path=BASELINE_FILENAME,
+                  algorithm: str = DEFAULT_ALGORITHM,
+                  interval: float = DEFAULT_INTERVAL,
+                  log_path=LOG_FILENAME,
+                  ignore_path=None,
+                  verbose: bool = False,
+                  max_scans: Optional[int] = None,
+                  iterations: Optional[int] = None,
+                  use_colour: Optional[bool] = None,
+                  logger: Optional[logging.Logger] = None,
+                  alert_once: bool = True,
+                  verify_signature: bool = False,
+                  require_signature: bool = False,
+                  key: Optional[bytes] = None) -> int:
+    """``python main.py watch`` - continuous monitoring until interrupted.
+
+    Behaviour
+    ---------
+    * loads ``baseline.json`` once and re-scans the folder every ``interval``
+      seconds,
+    * alerts (coloured) and logs when files are added, modified or deleted,
+    * logs scan errors, keeps running, and never reports an unreadable file as
+      deleted (the comparison protects those paths),
+    * handles ``Ctrl+C`` / ``SIGTERM`` cleanly: no traceback, exit code 130,
+    * accepts a ``stop_event``-like hook so tests can run it deterministically.
+
+    Parameters
+    ----------
+    interval:
+        Seconds between scans (must be >= ``MIN_INTERVAL``).
+    max_scans / iterations:
+        Test hooks - stop after N scans. ``max_scans`` is the current name;
+        ``iterations`` is kept as an alias for backward compatibility.
+    alert_once:
+        ``True`` (default) alerts each change once, then advances an in-memory
+        reference so the next scan does not repeat it. ``baseline.json`` is
+        never modified. ``False`` keeps comparing with the original baseline
+        and re-alerts for as long as the difference exists.
+    use_colour:
+        ``None`` = auto-detect from the terminal.
+
+    Returns
+    -------
+    int
+        ``EXIT_OK`` when the requested number of scans completed,
+        ``EXIT_FAILURE`` for a startup problem, ``EXIT_INTERRUPTED`` after Ctrl+C.
+    """
+    logger = logger or setup_logging(log_path, verbose=verbose)
+    folder_path = Path(folder)
+    baseline_target = _resolve_baseline_path(baseline_path)
+    limit = max_scans if max_scans is not None else iterations
+    if use_colour is None:
+        use_colour = supports_colour()
+
+    print("=" * 74)
+    print(paint("FILEWATCH - CONTINUOUS MONITORING", "bold", use_colour).center(74))
+    print("=" * 74)
+    print(f"Folder    : {folder_path}")
+    print(f"Baseline  : {baseline_target}")
+    print(f"Algorithm : {algorithm.upper().replace('SHA', 'SHA-')}")
+    print(f"Interval  : {interval:g} second(s)")
+    print(f"Log file  : {log_path}")
+
+    if interval < MIN_INTERVAL:
+        message = (f"Interval must be >= {MIN_INTERVAL:g} seconds (got {interval:g}). "
+                   f"Use e.g. --interval 5 for one scan every five seconds.")
+        print(f"  [ERROR] {message}", file=sys.stderr)
+        logger.error(message)
+        return EXIT_FAILURE
+
+    if not folder_path.exists() or not folder_path.is_dir():
+        message = f"Monitored folder is missing or not a folder: {folder_path}"
+        print(f"  [ERROR] {message}", file=sys.stderr)
+        logger.error(message)
+        return EXIT_FAILURE
+
+    baseline = load_baseline(baseline_path, verify=verify_signature,
+                             require_signature=True if require_signature else None,
+                             key=key)
+    if baseline is None:
+        message = ("No usable baseline - run `python main.py baseline` first. "
+                   "Monitoring will not start.")
+        print(f"  [ERROR] {message}", file=sys.stderr)
+        logger.error(message)
+        return EXIT_FAILURE
+
+    ignore_rules = load_ignore_rules(ignore_path, folder=folder_path)
+    print(f"Ignore    : {len(ignore_rules)} pattern(s)"
+          + (f" from {ignore_rules.source}" if ignore_rules.source else " (built-in only)"))
+    print("-" * 74)
+    print("Press Ctrl+C to stop.")
+    print(f"Baseline loaded: {len(baseline)} file(s).")
+    print("=" * 74)
+    logger.info(
+        "Watch started: folder=%s algorithm=%s interval=%ss files=%d patterns=%d",
+        folder_path, algorithm, interval, len(baseline), len(ignore_rules),
+    )
+
+    # The in-memory comparison reference. It starts as the loaded baseline and
+    # may move forward (see alert_once) without ever touching baseline.json.
+    reference: Dict[str, dict] = dict(baseline)
+
+    scans = 0
+    exit_code = EXIT_OK
+    quiet_rounds = 0
+
+    try:
+        while True:
+            scans += 1
+            current, result = scan_once(folder_path, reference, algorithm=algorithm,
+                                        ignore=ignore_rules, root=folder_path)
+
+            stamp = datetime.now().strftime("%H:%M:%S")
+            if has_changes(result) or result.get("unreadable"):
+                log_result(result, logger)
+                print_alerts(result, current=current, baseline=baseline,
+                             algorithm=algorithm, use_colour=use_colour)
+                if alert_once:
+                    # Keep the original baseline for reporting "last known"
+                    # hashes, but move the comparison reference forward so the
+                    # same change is not reported again next cycle.
+                    reference = advance_reference(reference, current, result)
+            else:
+                quiet_rounds += 1
+                logger.info("Scan %d: no changes (%d file(s))", scans, len(current))
+                print(paint(f"[{stamp}] scan {scans}: no changes "
+                            f"({len(current)} file(s) monitored)", "grey", use_colour))
+
+            if limit is not None and scans >= limit:
+                logger.info("Stopping after %d requested scan(s).", scans)
+                break
+
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        # Ctrl+C: clean shutdown, no traceback.
+        logger.info("Watch interrupted by user after %d scan(s).", scans)
+        print(f"\n{paint('[stopped]', 'yellow', use_colour)} "
+              f"Monitoring stopped by user after {scans} scan(s).")
+        print(f"Log written to {log_path}.")
+        exit_code = EXIT_INTERRUPTED
+    except (OSError, PermissionError) as exc:
+        logger.exception("Watch loop stopped by an OS error")
+        print(f"  [ERROR] Monitoring stopped: {exc}", file=sys.stderr)
+        exit_code = EXIT_FAILURE
+    finally:
+        logger.info("Watch ended: scans=%d exit_code=%d", scans, exit_code)
+
+    return exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -926,6 +2025,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "  python main.py --algorithm sha1    Week 1: use SHA-1 instead\n"
             "  python main.py baseline            Week 2: save baseline.json\n"
             "  python main.py check               Week 2: compare with baseline.json\n"
+            "  python main.py watch               Week 3: monitor continuously\n"
+            "  python main.py watch --interval 5  Week 3: scan every 5 seconds\n"
+            "  python main.py watch --once        Week 3: one scan, then exit\n"
             "  python main.py check --algorithm sha1\n"
             "\n"
             "Exit codes: 0 = OK / no changes, 1 = error, 2 = changes found or "
@@ -938,9 +2040,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["baseline", "check"],
+        choices=["baseline", "check", "watch", "keygen"],
         default=None,
-        help="'baseline' saves a hash snapshot, 'check' compares against it",
+        help=("'baseline' saves a hash snapshot, 'check' compares against it, "
+              "'watch' monitors continuously until interrupted"),
     )
 
     parser.add_argument(
@@ -968,7 +2071,82 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help=f"baseline file to write/read (default: {BASELINE_FILENAME} at the project root)",
     )
 
+    # --- Week 3: continuous monitoring options -----------------------------
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=DEFAULT_INTERVAL,
+        metavar="SECONDS",
+        help=f"seconds between scans for 'watch' (default: {DEFAULT_INTERVAL:g})",
+    )
+    parser.add_argument(
+        "--log",
+        default=LOG_FILENAME,
+        metavar="PATH",
+        help=f"log file for 'watch' (default: {LOG_FILENAME} at the project root)",
+    )
+    parser.add_argument(
+        "--ignore",
+        default=None,
+        metavar="PATH",
+        help=f"ignore file with patterns (default: {IGNORE_FILENAME})",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="'watch': perform a single scan then exit (useful for cron/CI)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="write DEBUG-level detail to the log file",
+    )
+    # --- Week 4 (stretch): HMAC baseline signing ---------------------------
+    parser.add_argument(
+        "--sign",
+        action="store_true",
+        help="'baseline': sign the baseline with HMAC-SHA256",
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="'check'/'watch': verify the baseline signature before using it",
+    )
+    parser.add_argument(
+        "--require-signature",
+        action="store_true",
+        help="'check'/'watch': refuse an unsigned baseline (implies --verify)",
+    )
+    parser.add_argument(
+        "--key-file",
+        default=None,
+        metavar="PATH",
+        help=f"HMAC key file, mode 0600 (default: ${HMAC_KEY_FILE_ENV})",
+    )
+    parser.add_argument(
+        "--out",
+        default=None,
+        metavar="PATH",
+        help="'keygen': also write the new key to this file (mode 0600)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="'keygen': overwrite an existing key file",
+    )
+    parser.add_argument(
+        "--repeat-alerts",
+        action="store_true",
+        help="'watch': re-alert every cycle while a change persists "
+             "(default: alert each change once)",
+    )
+
     args = parser.parse_args(argv)
+
+    # An explicit --key-file is exported so resolve_hmac_key() uses it without
+    # threading another parameter through every command.
+    if getattr(args, "key_file", None):
+        os.environ[HMAC_KEY_FILE_ENV] = str(args.key_file)
 
     if args.algorithm not in SUPPORTED_ALGORITHMS:
         parser.error(
@@ -990,12 +2168,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         folder = Path(__file__).resolve().parent / folder
 
     # --- Week 2 commands ---------------------------------------------------
+    if args.command == "keygen":
+        return command_keygen(output_path=args.out, force=args.force)
     if args.command == "baseline":
         return command_baseline(folder, baseline_path=args.baseline,
-                                algorithm=args.algorithm)
+                                algorithm=args.algorithm, ignore_path=args.ignore,
+                                sign=args.sign)
     if args.command == "check":
         return command_check(folder, baseline_path=args.baseline,
-                             algorithm=args.algorithm)
+                             algorithm=args.algorithm, ignore_path=args.ignore,
+                             verify_signature=args.verify or args.require_signature,
+                             require_signature=args.require_signature)
+    if args.command == "watch":
+        return command_watch(folder, baseline_path=args.baseline,
+                             algorithm=args.algorithm, interval=args.interval,
+                             log_path=args.log, ignore_path=args.ignore,
+                             verbose=args.verbose,
+                             max_scans=1 if args.once else None,
+                             alert_once=not args.repeat_alerts,
+                             verify_signature=args.verify or args.require_signature,
+                             require_signature=args.require_signature)
 
     # --- Week 1 behaviour: hash everything now, optionally demonstrate ------
     results = monitor_folder(folder, algorithm=args.algorithm)
@@ -1014,9 +2206,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     return EXIT_OK
 
 
+def _install_sigterm_handler() -> None:
+    """Treat SIGTERM like Ctrl+C so `kill` also shuts down cleanly.
+
+    Only SIGTERM is touched (SIGINT already raises KeyboardInterrupt), and only
+    on platforms that provide it. Terminals do not allow signal handlers from
+    non-main threads, so failure to install is ignored.
+    """
+    term_signal = getattr(signal, "SIGTERM", None)
+    if term_signal is None:
+        return
+    try:
+        def _raise_interrupt(signum, frame):  # noqa: ANN001 - signal signature
+            raise KeyboardInterrupt
+
+        signal.signal(term_signal, _raise_interrupt)
+    except (ValueError, OSError, AttributeError):  # pragma: no cover
+        pass
+
+
 if __name__ == "__main__":
+    _install_sigterm_handler()
     try:
         sys.exit(main())
     except KeyboardInterrupt:
+        # Clean exit: no traceback for a normal interruption.
         print("\nInterrupted by user.", file=sys.stderr)
-        sys.exit(130)
+        sys.exit(EXIT_INTERRUPTED)

@@ -1057,5 +1057,1402 @@ def test_pytest_shipped_baseline_matches_shipped_test_folder():
     assert result["unchanged"], "expected the sample files to be covered"
 
 
+# ===========================================================================
+# WEEK 3 TESTS - continuous monitoring, logging, ignore rules, robustness
+# ===========================================================================
+#
+# Same conventions as the Week 2 tests: plain module-level functions using
+# pytest's `tmp_path`, runnable by BOTH pytest and unittest.
+#
+# Determinism note: no test waits on real time. The watch loop is exercised with
+# interval=0 and `max_scans`, which exits after the requested number of scans.
+# Clean shutdown (Ctrl+C / SIGTERM) is simulated by making the scan raise
+# KeyboardInterrupt, exactly what the signal handler does.
+
+import logging
+import re
+
+
+# ---------------------------------------------------------------------------
+# Week 3 helpers
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def clean_logging():
+    """Give each test a fresh logger and always tear the handlers down."""
+    main.reset_logging()
+    yield
+    main.reset_logging()
+
+
+def _quiet_command(func, *args, **kwargs):
+    """Run a command function with its console output captured."""
+    with contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(io.StringIO()):
+        return func(*args, **kwargs)
+
+
+def _baseline_for(tmp_path, files, ignore_text=None):
+    """Create a folder + baseline.json; returns (folder, baseline_path)."""
+    folder = _make_folder(tmp_path / "test_folder", files)
+    baseline_path = tmp_path / "baseline.json"
+    _quiet_command(main.command_baseline, folder, baseline_path=baseline_path)
+    return folder, baseline_path
+
+
+def _read_log(path):
+    """Return the contents of the log file (or '' when it was not created)."""
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# 1. Ignore rules - pattern matching
+# ---------------------------------------------------------------------------
+
+def test_w3_ignore_rules_match_globs_and_folder_names(tmp_path):
+    """*.tmp, .git, .venv and __pycache__ all match at any depth."""
+    ignore_path = tmp_path / ".filewatchignore"
+    ignore_path.write_text(
+        "# comment line\n"
+        "\n"
+        "*.tmp\n"
+        ".git\n"
+        ".venv\n"
+        "__pycache__\n"
+        "**/cache\n",
+        encoding="utf-8",
+    )
+    rules = main.IgnoreRules.from_file(ignore_path)
+
+    # matched
+    assert rules.is_ignored("notes.tmp")
+    assert rules.is_ignored("subfolder/deep/notes.tmp")
+    assert rules.is_ignored(".git/config")
+    assert rules.is_ignored("project/.git/HEAD")
+    assert rules.is_ignored(".venv/lib/python3.9/site-packages/x.py")
+    assert rules.is_ignored("__pycache__/module.cpython-313.pyc")
+    assert rules.is_ignored("src/__pycache__/module.pyc")
+    assert rules.is_ignored("a/b/cache/thing.bin")
+
+    # not matched
+    assert not rules.is_ignored("file1.txt")
+    assert not rules.is_ignored("subfolder/file9.txt")
+    assert not rules.is_ignored("tmpfile.txt")
+    assert not rules.is_ignored("gitnotes.md")
+
+
+def test_w3_ignore_comments_and_blank_lines_are_skipped(tmp_path):
+    """Comments and blank lines never become patterns."""
+    ignore_path = tmp_path / ".filewatchignore"
+    ignore_path.write_text("# only a comment\n\n   \n*.log\n", encoding="utf-8")
+
+    rules = main.IgnoreRules.from_file(ignore_path)
+
+    assert rules.patterns == ["*.log"]
+    assert len(rules) == 1
+
+
+def test_w3_ignore_file_missing_is_harmless(tmp_path):
+    """A missing ignore file simply means no extra rules (no crash)."""
+    rules = main.IgnoreRules.from_file(tmp_path / "nope.filewatchignore")
+    assert rules.patterns == []
+
+
+def test_w3_builtin_patterns_always_apply():
+    """The tool's own log file is ignored even without a config file."""
+    rules = main.IgnoreRules.default()
+    assert rules.is_ignored("filewatch.log")
+    assert rules.is_ignored("baseline.json.tmp")
+    assert rules.is_ignored("xpkg/__pycache__/m.pyc")
+
+
+def test_w3_shipped_filewatchignore_covers_required_patterns():
+    """The shipped .filewatchignore contains *.tmp, .git, .venv, __pycache__."""
+    ignore_path = Path(__file__).resolve().parent / main.IGNORE_FILENAME
+    assert ignore_path.is_file(), ".filewatchignore should ship with the project"
+
+    rules = main.IgnoreRules.from_file(ignore_path)
+    for required in ("*.tmp", ".git", ".venv", "__pycache__"):
+        assert required in rules.patterns, f"{required} missing from .filewatchignore"
+
+
+# ---------------------------------------------------------------------------
+# 2. Ignore rules applied to scanning, baselines and comparisons
+# ---------------------------------------------------------------------------
+
+def test_w3_ignored_files_never_enter_a_baseline(tmp_path):
+    """Ignored files are excluded from the snapshot and the baseline JSON."""
+    folder = _make_folder(tmp_path / "test_folder", {
+        "keep.txt": "keep me\n",
+        "skip.tmp": "ignore me\n",
+        "__pycache__/module.pyc": "bytecode\n",
+        ".venv/lib/thing.py": "dependency\n",
+        ".git/HEAD": "ref\n",
+    })
+    ignore_path = tmp_path / ".filewatchignore"
+    ignore_path.write_text("*.tmp\n__pycache__\n.venv\n.git\n", encoding="utf-8")
+    baseline_path = tmp_path / "baseline.json"
+
+    _quiet_command(main.command_baseline, folder, baseline_path=baseline_path,
+                   ignore_path=ignore_path)
+
+    stored = json.loads(baseline_path.read_text(encoding="utf-8"))
+    assert list(stored["files"]) == ["keep.txt"]
+
+
+def test_w3_ignored_files_never_trigger_alerts(tmp_path):
+    """Creating ignored files after the baseline produces no changes at all."""
+    folder, baseline_path = _baseline_for(tmp_path, {"file1.txt": "one\n"})
+    ignore_path = tmp_path / ".filewatchignore"
+    ignore_path.write_text("*.tmp\n*.log\n__pycache__\n.git\n.venv\n", encoding="utf-8")
+
+    # Re-baseline with the ignore file in effect.
+    _quiet_command(main.command_baseline, folder, baseline_path=baseline_path,
+                   ignore_path=ignore_path)
+
+    # Now create a pile of noise.
+    (folder / "noise.tmp").write_bytes(b"noise\n")
+    (folder / "output.log").write_bytes(b"log line\n")
+    (folder / "__pycache__").mkdir()
+    (folder / "__pycache__" / "x.pyc").write_bytes(b"bytecode\n")
+    (folder / ".git").mkdir()
+    (folder / ".git" / "HEAD").write_bytes(b"ref\n")
+    (folder / ".venv").mkdir()
+    (folder / ".venv" / "activate").write_bytes(b"script\n")
+
+    exit_code = _quiet_command(main.command_check, folder,
+                               baseline_path=baseline_path,
+                               ignore_path=ignore_path)
+
+    assert exit_code == main.EXIT_OK
+    rules = main.load_ignore_rules(ignore_path, folder=folder)
+    baseline = _quiet_command(main.load_baseline, baseline_path)
+    current = _quiet_command(main.build_snapshot, folder, ignore=rules)
+    result = _quiet_command(main.compare_snapshots, baseline, current)
+
+    assert result["added"] == []
+    assert not main.has_changes(result), "ignored noise must not raise alerts"
+
+
+def test_w3_watch_reports_no_change_for_ignored_files(tmp_path, clean_logging):
+    """A full watch scan ignores noise and logs no change alerts."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+    baseline_path = tmp_path / "baseline.json"
+    ignore_path = tmp_path / ".filewatchignore"
+    ignore_path.write_text("*.tmp\n", encoding="utf-8")
+    log_path = tmp_path / "filewatch.log"
+    _quiet_command(main.command_baseline, folder, baseline_path=baseline_path,
+                   ignore_path=ignore_path)
+
+    (folder / "scratch.tmp").write_bytes(b"temporary\n")
+
+    exit_code = _quiet_command(main.command_watch, folder,
+                               baseline_path=baseline_path, interval=0,
+                               log_path=log_path, ignore_path=ignore_path,
+                               max_scans=1)
+
+    assert exit_code == main.EXIT_OK
+    log_text = _read_log(log_path)
+    assert "scratch.tmp" not in log_text
+    assert "no changes" in log_text
+
+
+def test_w3_ignore_rules_prune_ignored_directories_early(tmp_path):
+    """Ignored directories are pruned, so their files are never walked."""
+    folder = _make_folder(tmp_path / "test_folder", {
+        "keep.txt": "keep\n",
+        ".git/objects/deep/blob": "gitdata\n",
+    })
+    rules = main.IgnoreRules([".git"])
+
+    files, skipped = _quiet_command(main.walk_regular_files, folder, ignore=rules)
+    names = [main._relative_key(item, folder) for item in files]
+
+    assert names == ["keep.txt"]
+    assert any(".git" in note and "ignored" in note for note in skipped)
+
+
+# ---------------------------------------------------------------------------
+# 3. Monitoring: changes detected by the watch loop
+# ---------------------------------------------------------------------------
+
+def test_w3_watch_alerts_added_modified_deleted(tmp_path, clean_logging, capsys):
+    """One watch scan reports ADDED, MODIFIED and DELETED with relative paths."""
+    folder = _make_folder(tmp_path / "test_folder", {
+        "file1.txt": "one\n",
+        "file2.txt": "two\n",
+        "subfolder/deep.txt": "deep\n",
+    })
+    baseline_path = tmp_path / "baseline.json"
+    log_path = tmp_path / "filewatch.log"
+    _quiet_command(main.command_baseline, folder, baseline_path=baseline_path)
+
+    (folder / "subfolder" / "new_file.txt").write_bytes(b"new\n")
+    (folder / "file1.txt").write_bytes(b"one, edited\n")
+    (folder / "file2.txt").unlink()
+
+    # Called directly (not via _quiet_command) so capsys can see the alerts.
+    exit_code = main.command_watch(folder, baseline_path=baseline_path,
+                                   interval=0, log_path=log_path,
+                                   max_scans=1, use_colour=False)
+    captured = capsys.readouterr().out
+
+    assert exit_code == main.EXIT_OK
+    assert "ADDED (1)" in captured
+    assert "subfolder/new_file.txt" in captured
+    assert "MODIFIED (1)" in captured
+    assert "file1.txt" in captured
+    assert "DELETED (1)" in captured
+    assert "file2.txt" in captured
+
+
+def test_w3_watch_logs_every_change_and_scan(tmp_path, clean_logging):
+    """The log file records start, each change, and the end of the run."""
+    folder, baseline_path = _baseline_for(tmp_path, {"file1.txt": "one\n"})
+    log_path = tmp_path / "filewatch.log"
+    (folder / "added.txt").write_bytes(b"added\n")
+
+    _quiet_command(main.command_watch, folder, baseline_path=baseline_path,
+                   interval=0, log_path=log_path, max_scans=1)
+
+    log_text = _read_log(log_path)
+    assert "Watch started" in log_text
+    assert "ADDED file: added.txt" in log_text
+    assert "Watch ended" in log_text
+    # Structured format: timestamp | level | logger | message
+    assert " | WARNING  | filewatch | " in log_text
+    assert " | INFO     | filewatch | " in log_text
+
+
+def test_w3_watch_repeats_alerts_or_not(tmp_path, clean_logging):
+    """alert_once=True reports a change once; False repeats it each scan."""
+    folder, baseline_path = _baseline_for(tmp_path, {"file1.txt": "one\n"})
+    (folder / "added.txt").write_bytes(b"added\n")
+
+    once_log = tmp_path / "once.log"
+    _quiet_command(main.command_watch, folder, baseline_path=baseline_path,
+                   interval=0, log_path=once_log, max_scans=3)
+    assert _read_log(once_log).count("ADDED file: added.txt") == 1
+
+    main.reset_logging()
+    always_log = tmp_path / "always.log"
+    _quiet_command(main.command_watch, folder, baseline_path=baseline_path,
+                   interval=0, log_path=always_log, max_scans=3,
+                   alert_once=False)
+    assert _read_log(always_log).count("ADDED file: added.txt") == 3
+
+
+def test_w3_watch_never_modifies_the_baseline_file(tmp_path, clean_logging):
+    """watch advances only an in-memory reference - baseline.json is untouched."""
+    folder, baseline_path = _baseline_for(tmp_path, {"file1.txt": "one\n"})
+    before = baseline_path.read_bytes()
+
+    (folder / "added.txt").write_bytes(b"new\n")
+    (folder / "file1.txt").write_bytes(b"changed\n")
+
+    _quiet_command(main.command_watch, folder, baseline_path=baseline_path,
+                   interval=0, log_path=tmp_path / "x.log", max_scans=3)
+
+    assert baseline_path.read_bytes() == before
+
+
+def test_w3_advance_reference_updates_only_alerted_paths():
+    """advance_reference() applies added/modified/deleted and keeps the rest."""
+    reference = {
+        "keep.txt": {"sha256": "aaa"},
+        "gone.txt": {"sha256": "bbb"},
+        "change.txt": {"sha256": "ccc"},
+    }
+    current = {
+        "keep.txt": {"sha256": "aaa"},
+        "change.txt": {"sha256": "DDD"},
+        "new.txt": {"sha256": "eee"},
+    }
+    result = main.compare_snapshots(reference, current)
+
+    updated = main.advance_reference(reference, current, result)
+
+    assert set(updated) == {"keep.txt", "change.txt", "new.txt"}
+    assert updated["change.txt"]["sha256"] == "DDD"
+    assert updated["new.txt"]["sha256"] == "eee"
+    assert reference["change.txt"]["sha256"] == "ccc", "input must not be mutated"
+
+
+def test_w3_scan_once_returns_snapshot_and_result(tmp_path, clean_logging):
+    """scan_once() is the reusable single cycle used by watch."""
+    folder, baseline_path = _baseline_for(tmp_path, {"file1.txt": "one\n"})
+    baseline = _quiet_command(main.load_baseline, baseline_path)
+    (folder / "file2.txt").write_bytes(b"two\n")
+
+    current, result = _quiet_command(main.scan_once, folder, baseline)
+
+    assert "file2.txt" in current
+    assert result["added"] == ["file2.txt"]
+
+
+# ---------------------------------------------------------------------------
+# 4. Robust error handling
+# ---------------------------------------------------------------------------
+
+def test_w3_permission_error_is_logged_and_monitoring_continues(
+        tmp_path, clean_logging):
+    """A PermissionError on one file logs an error; the loop keeps going."""
+    folder, baseline_path = _baseline_for(tmp_path, {
+        "good.txt": "readable\n",
+        "locked.txt": "unreadable\n",
+    })
+    log_path = tmp_path / "filewatch.log"
+    real_open = builtins.open
+
+    def selective_open(file, mode="r", *args, **kwargs):
+        if Path(file).name == "locked.txt":
+            raise PermissionError(13, "Permission denied")
+        return real_open(file, mode, *args, **kwargs)
+
+    with mock.patch("builtins.open", side_effect=selective_open):
+        exit_code = _quiet_command(main.command_watch, folder,
+                                   baseline_path=baseline_path, interval=0,
+                                   log_path=log_path, max_scans=2)
+
+    log_text = _read_log(log_path)
+    assert exit_code == main.EXIT_OK, "monitoring must survive a file error"
+    assert "Unreadable file" in log_text
+    assert "locked.txt" in log_text
+
+
+def test_w3_unreadable_file_is_not_reported_as_deleted(tmp_path, clean_logging):
+    """An unreadable file is never announced as DELETED."""
+    folder, baseline_path = _baseline_for(tmp_path, {
+        "file1.txt": "one\n",
+        "locked.txt": "two\n",
+    })
+    baseline = _quiet_command(main.load_baseline, baseline_path)
+    real_open = builtins.open
+
+    def selective_open(file, mode="r", *args, **kwargs):
+        if Path(file).name == "locked.txt":
+            raise PermissionError(13, "Permission denied")
+        return real_open(file, mode, *args, **kwargs)
+
+    with mock.patch("builtins.open", side_effect=selective_open):
+        _current, result = _quiet_command(main.scan_once, folder, baseline)
+
+    assert result["deleted"] == [], "must not claim a real deletion"
+    assert result["unreadable"] == ["locked.txt"]
+    assert not main.has_changes(result)
+
+
+def test_w3_unreadable_file_that_really_vanishes_is_deleted(tmp_path, clean_logging):
+    """Once the path is genuinely gone, DELETED is reported."""
+    folder, baseline_path = _baseline_for(tmp_path, {
+        "file1.txt": "one\n",
+        "vanishing.txt": "two\n",
+    })
+    baseline = _quiet_command(main.load_baseline, baseline_path)
+    (folder / "vanishing.txt").unlink()  # the file really is gone
+    current = _quiet_command(main.build_snapshot, folder)
+
+    # The file was unreadable in the previous cycle, but it no longer exists:
+    # this is a genuine deletion, so it is reported.
+    result = _quiet_command(main.compare_snapshots, baseline, current,
+                            main.DEFAULT_ALGORITHM, {"vanishing.txt"}, folder)
+
+    assert result["deleted"] == ["vanishing.txt"]
+    assert result["unreadable"] == []
+
+
+def test_w3_file_disappearing_between_walk_and_read(tmp_path, clean_logging):
+    """A file removed mid-scan is logged, not crashed on, and not "deleted"."""
+    folder, baseline_path = _baseline_for(tmp_path, {
+        "file1.txt": "one\n",
+        "race.txt": "two\n",
+    })
+    baseline = _quiet_command(main.load_baseline, baseline_path)
+    real_open = builtins.open
+
+    def vanishing_open(file, mode="r", *args, **kwargs):
+        if Path(file).name == "race.txt":
+            raise FileNotFoundError(2, "No such file or directory")
+        return real_open(file, mode, *args, **kwargs)
+
+    with mock.patch("builtins.open", side_effect=vanishing_open):
+        _current, result = _quiet_command(main.scan_once, folder, baseline)
+
+    # The path still exists on disk, so it is "unreadable", not "deleted".
+    assert result["unreadable"] == ["race.txt"]
+    assert result["deleted"] == []
+
+
+def test_w3_oserror_in_walk_does_not_stop_the_scan(tmp_path, clean_logging):
+    """An OSError while listing a directory is contained."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+
+    def boom(*args, **kwargs):
+        raise OSError(5, "Input/output error")
+
+    with mock.patch("main.os.walk", side_effect=boom):
+        snapshot = _quiet_command(main.build_snapshot, folder)
+
+    assert snapshot == {}, "a broken walk returns an empty snapshot, not a crash"
+
+
+def test_w3_watch_startup_errors_return_failure(tmp_path, clean_logging):
+    """Missing baseline / missing folder / tiny interval all fail cleanly."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+    log_path = tmp_path / "filewatch.log"
+
+    # No baseline yet
+    assert _quiet_command(main.command_watch, folder,
+                          baseline_path=tmp_path / "missing.json",
+                          interval=0, log_path=log_path,
+                          max_scans=1) == main.EXIT_FAILURE
+
+    # Baseline exists, folder gone
+    baseline_path = tmp_path / "baseline.json"
+    _quiet_command(main.command_baseline, folder, baseline_path=baseline_path)
+    assert _quiet_command(main.command_watch, tmp_path / "no_such_folder",
+                          baseline_path=baseline_path, interval=0,
+                          log_path=log_path, max_scans=1) == main.EXIT_FAILURE
+
+    # Negative interval is nonsense and must be refused
+    assert _quiet_command(main.command_watch, folder,
+                          baseline_path=baseline_path, interval=-1,
+                          log_path=log_path, max_scans=1) == main.EXIT_FAILURE
+
+    # Sanity check the boundary: 0 is allowed, -0.001 is not
+    assert main.MIN_INTERVAL == 0.0
+    assert _quiet_command(main.command_watch, folder,
+                          baseline_path=baseline_path, interval=-0.001,
+                          log_path=log_path, max_scans=1) == main.EXIT_FAILURE
+
+
+def test_w3_check_never_writes_baseline_on_error(tmp_path):
+    """A check against a broken baseline leaves the file untouched."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text("{broken", encoding="utf-8")
+    before = baseline_path.read_bytes()
+
+    exit_code = _quiet_command(main.command_check, folder,
+                               baseline_path=baseline_path)
+
+    assert exit_code == main.EXIT_FAILURE
+    assert baseline_path.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# 5. Clean shutdown
+# ---------------------------------------------------------------------------
+
+def test_w3_ctrl_c_exits_cleanly_without_traceback(tmp_path, clean_logging, capsys):
+    """KeyboardInterrupt -> exit 130, friendly message, no traceback."""
+    folder, baseline_path = _baseline_for(tmp_path, {"file1.txt": "one\n"})
+    log_path = tmp_path / "filewatch.log"
+
+    with mock.patch("main.scan_once", side_effect=KeyboardInterrupt):
+        exit_code = main.command_watch(folder, baseline_path=baseline_path,
+                                       interval=0, log_path=log_path,
+                                       max_scans=5)
+
+    captured = capsys.readouterr()
+    assert exit_code == main.EXIT_INTERRUPTED == 130
+    assert "stopped by user" in captured.out
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+    assert "interrupted by user" in _read_log(log_path).lower()
+
+
+def test_w3_sigterm_is_translated_to_clean_exit(tmp_path, clean_logging):
+    """The SIGTERM handler raises KeyboardInterrupt, which watch handles."""
+    folder, baseline_path = _baseline_for(tmp_path, {"file1.txt": "one\n"})
+
+    main._install_sigterm_handler()
+
+    # Simulate the handler firing: it must raise KeyboardInterrupt, not exit.
+    with mock.patch("main.scan_once", side_effect=KeyboardInterrupt):
+        exit_code = main.command_watch(folder, baseline_path=baseline_path,
+                                       interval=0,
+                                       log_path=tmp_path / "term.log",
+                                       max_scans=5)
+    assert exit_code == main.EXIT_INTERRUPTED
+
+
+def test_w3_watch_returns_ok_after_requested_scans(tmp_path, clean_logging):
+    """--once style operation completes normally with EXIT_OK."""
+    folder, baseline_path = _baseline_for(tmp_path, {"file1.txt": "one\n"})
+
+    exit_code = _quiet_command(main.command_watch, folder,
+                               baseline_path=baseline_path, interval=0,
+                               log_path=tmp_path / "once.log", max_scans=1)
+
+    assert exit_code == main.EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# 6. Logging hygiene
+# ---------------------------------------------------------------------------
+
+def test_w3_setup_logging_does_not_duplicate_handlers(tmp_path, clean_logging):
+    """Calling setup_logging() repeatedly keeps exactly one file handler."""
+    log_path = tmp_path / "filewatch.log"
+
+    main.setup_logging(log_path, console=False)
+    main.setup_logging(log_path, console=False)
+    main.setup_logging(log_path, console=False)
+
+    logger = logging.getLogger(main.LOGGER_NAME)
+    managed = [h for h in logger.handlers
+               if getattr(h, "_filewatch_managed", False)]
+
+    assert len(managed) == 1
+
+    # And each event is written exactly once.
+    logger.warning("unique marker line")
+    for handler in managed:
+        handler.flush()
+    assert _read_log(log_path).count("unique marker line") == 1
+
+
+def test_w3_logger_does_not_propagate_to_root(tmp_path, clean_logging):
+    """The filewatch logger stays out of the application's root logger."""
+    main.setup_logging(tmp_path / "filewatch.log", console=False)
+    assert logging.getLogger(main.LOGGER_NAME).propagate is False
+
+
+def test_w3_reset_logging_removes_managed_handlers(tmp_path, clean_logging):
+    """reset_logging() leaves no managed handler behind."""
+    main.setup_logging(tmp_path / "filewatch.log")
+    main.reset_logging()
+
+    logger = logging.getLogger(main.LOGGER_NAME)
+    assert [h for h in logger.handlers
+            if getattr(h, "_filewatch_managed", False)] == []
+
+
+def test_w3_log_has_timestamp_level_and_message(tmp_path, clean_logging):
+    """Log lines are structured: timestamp | LEVEL | logger | message."""
+    folder, baseline_path = _baseline_for(tmp_path, {"file1.txt": "one\n"})
+    log_path = tmp_path / "filewatch.log"
+    (folder / "new.txt").write_bytes(b"new\n")
+
+    _quiet_command(main.command_watch, folder, baseline_path=baseline_path,
+                   interval=0, log_path=log_path, max_scans=1)
+
+    line = next(ln for ln in _read_log(log_path).splitlines()
+                if "ADDED file" in ln)
+    parts = [part.strip() for part in line.split("|")]
+    assert len(parts) == 4
+    assert parts[1] == "WARNING"
+    assert parts[2] == "filewatch"
+    assert "new.txt" in parts[3]
+    # Leading timestamp: YYYY-MM-DD HH:MM:SS
+    assert len(parts[0]) == 19 and parts[0][4] == "-" and parts[0][13] == ":"
+
+
+# ---------------------------------------------------------------------------
+# 7. Alerts (formatting and colour)
+# ---------------------------------------------------------------------------
+
+def test_w3_format_alerts_lists_relative_paths():
+    """Alert lines contain each changed relative path."""
+    result = {"added": ["sub/new.txt"], "modified": ["sub/changed.txt"],
+              "deleted": ["gone.txt"], "unchanged": [], "skipped": [],
+              "unreadable": []}
+
+    lines = main.format_alerts(result, use_colour=False)
+    text = "\n".join(lines)
+
+    assert "sub/new.txt" in text
+    assert "sub/changed.txt" in text
+    assert "gone.txt" in text
+    assert "ADDED (1)" in text and "MODIFIED (1)" in text and "DELETED (1)" in text
+
+
+def test_w3_format_alerts_colour_can_be_disabled_and_enabled():
+    """Colour escapes appear only when colour is enabled."""
+    result = {"added": ["a.txt"], "modified": [], "deleted": [],
+              "unchanged": [], "skipped": [], "unreadable": []}
+
+    plain = "\n".join(main.format_alerts(result, use_colour=False))
+    colourful = "\n".join(main.format_alerts(result, use_colour=True))
+
+    assert "\033[" not in plain
+    assert "\033[" in colourful
+
+
+def test_w3_colour_autodetection_respects_no_color(monkeypatch, tmp_path):
+    """NO_COLOR disables colour; a TTY enables it."""
+    class FakeTTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    assert main.supports_colour(FakeTTY()) is True
+
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert main.supports_colour(FakeTTY()) is False
+
+    monkeypatch.delenv("NO_COLOR")
+    monkeypatch.setenv("TERM", "dumb")
+    assert main.supports_colour(FakeTTY()) is False
+
+    monkeypatch.delenv("TERM")
+    assert main.supports_colour(io.StringIO()) is False, "not a TTY -> no colour"
+
+
+def test_w3_print_alerts_says_nothing_when_unchanged(capsys):
+    """print_alerts() returns False and prints nothing without changes."""
+    result = {"added": [], "modified": [], "deleted": [], "unchanged": ["a.txt"],
+              "skipped": [], "unreadable": []}
+
+    assert main.print_alerts(result, use_colour=False) is False
+    assert capsys.readouterr().out == ""
+
+
+def test_w3_unreadable_files_are_shown_in_alerts(capsys):
+    """Unreadable files get their own clearly-labelled section."""
+    result = {"added": [], "modified": [], "deleted": [],
+              "unchanged": [], "skipped": [], "unreadable": ["locked.txt"]}
+
+    main.print_alerts(result, use_colour=False)
+    out = capsys.readouterr().out
+
+    assert "UNREADABLE (1)" in out
+    assert "locked.txt" in out
+    assert "not reported as deleted" in out.lower()
+
+
+# ---------------------------------------------------------------------------
+# 8. Backward compatibility (Week 1 + Week 2 still intact)
+# ---------------------------------------------------------------------------
+
+def test_w3_week1_and_week2_apis_keep_their_old_signatures(tmp_path):
+    """Existing call styles must still work without the new arguments."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+
+    # Week 1
+    assert len(main.hash_file(folder / "file1.txt")) == 64
+    assert len(_quiet_command(main.hash_file, folder / "file1.txt", "sha1")) == 40
+    assert isinstance(_quiet_command(main.monitor_folder, folder), dict)
+
+    # Week 2 - no ignore/unreadable arguments at all
+    snapshot = _quiet_command(main.build_snapshot, folder)
+    result = _quiet_command(main.compare_snapshots, snapshot, snapshot)
+    assert result["unchanged"] == ["file1.txt"]
+    assert set(result) == {"added", "modified", "deleted", "unchanged",
+                           "skipped", "unreadable"}
+
+
+def test_w3_cli_still_supports_every_previous_command(tmp_path, capsys):
+    """baseline, check, default scan and --demo all still work through main()."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+    baseline_path = tmp_path / "baseline.json"
+
+    assert main.main(["--folder", str(folder), "--baseline", str(baseline_path),
+                      "baseline"]) == main.EXIT_OK
+    assert main.main(["--folder", str(folder), "--baseline", str(baseline_path),
+                      "check"]) == main.EXIT_OK
+    assert main.main(["--folder", str(folder)]) == main.EXIT_OK
+    assert main.main(["--folder", str(folder),
+                      "--log", str(tmp_path / "d.log"),
+                      "watch", "--once"]) == main.EXIT_OK
+    capsys.readouterr()
+
+
+def test_w3_cli_parses_watch_options():
+    """--interval, --log, --ignore, --once and --repeat-alerts are wired up."""
+    args = main.parse_args(["watch", "--interval", "2.5", "--log", "l.log",
+                            "--ignore", "i.cfg", "--once", "--repeat-alerts"])
+    assert args.command == "watch"
+    assert args.interval == 2.5
+    assert args.log == "l.log"
+    assert args.ignore == "i.cfg"
+    assert args.once is True
+    assert args.repeat_alerts is True
+
+    defaults = main.parse_args(["watch"])
+    assert defaults.interval == main.DEFAULT_INTERVAL
+    assert defaults.log == main.LOG_FILENAME
+    assert defaults.once is False
+    assert defaults.repeat_alerts is False
+
+
+def test_w3_cli_rejects_non_numeric_interval(tmp_path):
+    """A non-numeric --interval is a usage error (exit code 2)."""
+    with contextlib.redirect_stderr(io.StringIO()):
+        with pytest.raises(SystemExit) as excinfo:
+            main.parse_args(["watch", "--interval", "soon"])
+    assert excinfo.value.code == 2
+
+
+def test_w3_demo_still_never_modifies_originals(tmp_path):
+    """Week 1's safe demonstration still leaves the original untouched."""
+    folder = _make_folder(tmp_path / "test_folder", {"sample.txt": "original\n"})
+    before = (folder / "sample.txt").read_bytes()
+
+    result = _quiet_command(main.demonstrate_avalanche, folder)
+
+    assert result["changed"] is True
+    assert (folder / "sample.txt").read_bytes() == before
+    assert [p.name for p in folder.iterdir()] == ["sample.txt"]
+
+
+def test_w3_shipped_files_still_verify_against_shipped_baseline():
+    """The committed baseline still matches the shipped samples (with ignores)."""
+    project_root = Path(__file__).resolve().parent
+    baseline_path = project_root / main.BASELINE_FILENAME
+    if not baseline_path.is_file():
+        pytest.skip("baseline.json not shipped in this copy")
+
+    rules = main.load_ignore_rules(folder=project_root / "test_folder")
+    result = _quiet_command(main.compare_snapshots,
+                            _quiet_command(main.load_baseline, baseline_path),
+                            _quiet_command(main.build_snapshot,
+                                           project_root / "test_folder",
+                                           main.DEFAULT_ALGORITHM, rules))
+
+    assert not main.has_changes(result), (
+        f"added={result['added']} modified={result['modified']} "
+        f"deleted={result['deleted']}"
+    )
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+# ===========================================================================
+# WEEK 4 (STRETCH) TESTS - HMAC baseline signing
+# ===========================================================================
+#
+# Keys are generated in-process with secrets.token_hex() and passed as bytes,
+# so no secret is ever hardcoded, committed, or read from the environment of
+# the test machine. A couple of tests deliberately exercise the environment
+# variable path using monkeypatch, which is cleaned up automatically.
+
+import stat as _stat
+
+
+@pytest.fixture
+def hmac_key():
+    """A fresh random 32-byte HMAC key per test."""
+    return bytes.fromhex(main.generate_hmac_key())
+
+
+def _signed_baseline(tmp_path, files, key):
+    """Create a folder and a *signed* baseline.json; returns their paths."""
+    folder = _make_folder(tmp_path / "test_folder", files)
+    baseline_path = tmp_path / "baseline.json"
+    _quiet_command(main.command_baseline, folder, baseline_path=baseline_path,
+                   sign=True, key=key)
+    return folder, baseline_path
+
+
+def _read_json(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Key generation and resolution
+# ---------------------------------------------------------------------------
+
+def test_w4_keygen_is_random_and_long_enough():
+    """generate_hmac_key() returns unpredictable keys of >= 32 bytes."""
+    first = main.generate_hmac_key()
+    second = main.generate_hmac_key()
+
+    assert first != second, "two keys must never be identical"
+    assert len(bytes.fromhex(first)) >= main.MIN_HMAC_KEY_BYTES
+    int(first, 16)  # valid hex
+
+
+def test_w4_no_hardcoded_key_in_the_source():
+    """The source must not contain a literal key (documentation requirement)."""
+    source = (Path(__file__).resolve().parent / "main.py").read_text(encoding="utf-8")
+
+    # A 32+ byte hex literal would look like a key. There should be none.
+    suspicious = re.findall(r"['\"][0-9a-fA-F]{64,}['\"]", source)
+    assert suspicious == [], f"possible hardcoded key(s): {suspicious}"
+    # And the key always comes from the environment or a file.
+    assert "FILEWATCH_HMAC_KEY" in source
+
+
+def test_w4_resolve_key_from_explicit_bytes(hmac_key):
+    """An explicitly supplied key is used as-is."""
+    assert main.resolve_hmac_key(key=hmac_key) == hmac_key
+
+
+def test_w4_resolve_key_from_environment_hex(monkeypatch):
+    """A hex environment value is decoded as hex bytes."""
+    raw = main.generate_hmac_key()
+    monkeypatch.delenv(main.HMAC_KEY_FILE_ENV, raising=False)
+    monkeypatch.setenv(main.HMAC_KEY_ENV, raw)
+
+    resolved = main.resolve_hmac_key()
+
+    assert resolved == bytes.fromhex(raw)
+
+
+def test_w4_resolve_key_from_environment_raw_text(monkeypatch):
+    """A non-hex environment value is used as raw UTF-8 bytes."""
+    passphrase = "correct horse battery staple correct horse"  # 44 bytes
+    monkeypatch.delenv(main.HMAC_KEY_FILE_ENV, raising=False)
+    monkeypatch.setenv(main.HMAC_KEY_ENV, passphrase)
+
+    assert main.resolve_hmac_key() == passphrase.encode("utf-8")
+
+
+def test_w4_missing_key_raises_when_required(monkeypatch):
+    """No key + required=True -> a clear BaselineSignatureError."""
+    monkeypatch.delenv(main.HMAC_KEY_ENV, raising=False)
+    monkeypatch.delenv(main.HMAC_KEY_FILE_ENV, raising=False)
+
+    with pytest.raises(main.BaselineSignatureError) as excinfo:
+        main.resolve_hmac_key()
+    assert "No HMAC key configured" in str(excinfo.value)
+
+    # ... but asking politely for an optional key returns None.
+    assert main.resolve_hmac_key(required=False) is None
+
+
+def test_w4_short_key_is_rejected(monkeypatch):
+    """A key shorter than 32 bytes is refused."""
+    monkeypatch.setenv(main.HMAC_KEY_ENV, "abc123")
+    monkeypatch.delenv(main.HMAC_KEY_FILE_ENV, raising=False)
+
+    with pytest.raises(main.BaselineSignatureError) as excinfo:
+        main.resolve_hmac_key()
+    assert "too short" in str(excinfo.value)
+
+
+def test_w4_key_file_must_be_private(tmp_path, monkeypatch):
+    """A 0600 key file is accepted; a 0644 one is rejected."""
+    key_file = tmp_path / "hmac.key"
+    key_file.write_text(main.generate_hmac_key() + "\n", encoding="utf-8")
+    os.chmod(key_file, 0o600)
+    monkeypatch.delenv(main.HMAC_KEY_ENV, raising=False)
+    monkeypatch.setenv(main.HMAC_KEY_FILE_ENV, str(key_file))
+
+    assert main.resolve_hmac_key() == bytes.fromhex(key_file.read_text().strip())
+
+    os.chmod(key_file, 0o644)
+    with pytest.raises(main.BaselineSignatureError) as excinfo:
+        main.resolve_hmac_key()
+    assert "too permissive" in str(excinfo.value)
+
+
+def test_w4_missing_key_file_is_reported(tmp_path, monkeypatch):
+    """A configured but absent key file fails with a clear message."""
+    monkeypatch.delenv(main.HMAC_KEY_ENV, raising=False)
+    monkeypatch.setenv(main.HMAC_KEY_FILE_ENV, str(tmp_path / "nope.key"))
+
+    with pytest.raises(main.BaselineSignatureError) as excinfo:
+        main.resolve_hmac_key()
+    assert "not found" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Signing
+# ---------------------------------------------------------------------------
+
+def test_w4_signed_baseline_contains_a_signature_block(tmp_path, hmac_key):
+    """`baseline --sign` writes an hmac-sha256 signature into the JSON."""
+    _folder, baseline_path = _signed_baseline(tmp_path, {"file1.txt": "one\n"}, hmac_key)
+
+    data = _read_json(baseline_path)
+    signature = data[main.SIGNATURE_KEY]
+
+    assert signature["algorithm"] == "hmac-sha256"
+    assert len(signature["value"]) == 64  # 32-byte digest as hex
+    assert "files" in signature["signed_fields"]
+    # The signature itself is not part of what was signed.
+    assert main.SIGNATURE_KEY not in signature["signed_fields"]
+    assert "signed_fields" not in signature["signed_fields"]
+
+
+def test_w4_unsigned_baseline_has_no_signature(tmp_path):
+    """Without --sign the baseline is unchanged from Week 2 (no signature)."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+    baseline_path = tmp_path / "baseline.json"
+    _quiet_command(main.command_baseline, folder, baseline_path=baseline_path)
+
+    assert main.SIGNATURE_KEY not in _read_json(baseline_path)
+
+
+def test_w4_signature_is_deterministic_for_same_content(hmac_key):
+    """Signing identical metadata twice gives the identical signature."""
+    metadata = {"tool": "x", "files": {"a.txt": {"sha256": "abc"}}, "file_count": 1}
+
+    first = main.compute_baseline_signature(metadata, hmac_key)
+    second = main.compute_baseline_signature(metadata, hmac_key)
+
+    assert first == second
+
+
+def test_w4_signature_ignores_key_order(hmac_key):
+    """Reordered JSON keys still verify (sort_keys in the payload)."""
+    first = {"tool": "x", "algorithm": "sha256", "file_count": 1}
+    second = {"file_count": 1, "tool": "x", "algorithm": "sha256"}
+
+    assert (main.compute_baseline_signature(first, hmac_key)
+            == main.compute_baseline_signature(second, hmac_key))
+
+
+def test_w4_signing_without_key_aborts_and_writes_nothing(tmp_path, monkeypatch):
+    """A missing key refuses to produce an unsigned baseline by accident."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+    baseline_path = tmp_path / "baseline.json"
+    monkeypatch.delenv(main.HMAC_KEY_ENV, raising=False)
+    monkeypatch.delenv(main.HMAC_KEY_FILE_ENV, raising=False)
+
+    exit_code = _quiet_command(main.command_baseline, folder,
+                               baseline_path=baseline_path, sign=True)
+
+    assert exit_code == main.EXIT_FAILURE
+    assert not baseline_path.exists(), "must not write an unsigned baseline"
+
+
+def test_w4_save_baseline_returns_none_when_signing_fails(tmp_path):
+    """save_baseline(sign=True, key=too-short) fails cleanly."""
+    snapshot = {"file1.txt": {"sha256": "0" * 64, "size": 1, "mtime": 0.0}}
+    result = _quiet_command(main.save_baseline, snapshot,
+                            baseline_path=tmp_path / "b.json", sign=True,
+                            key=b"short")
+    assert result is None
+    assert not (tmp_path / "b.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Verification
+# ---------------------------------------------------------------------------
+
+def test_w4_verify_accepts_a_good_signature(tmp_path, hmac_key):
+    """verify_baseline_signature() returns True for an untouched baseline."""
+    _folder, baseline_path = _signed_baseline(tmp_path, {"file1.txt": "one\n"}, hmac_key)
+
+    ok, reason = main.verify_baseline_signature(_read_json(baseline_path), hmac_key)
+
+    assert ok is True
+    assert "verified" in reason
+
+
+def test_w4_verify_detects_a_tampered_hash(tmp_path, hmac_key):
+    """Editing a stored hash breaks the signature (the core threat model)."""
+    _folder, baseline_path = _signed_baseline(tmp_path, {"file1.txt": "one\n"}, hmac_key)
+    data = _read_json(baseline_path)
+    data["files"]["file1.txt"]["sha256"] = "0" * 64  # attacker hides a change
+    baseline_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    ok, reason = main.verify_baseline_signature(data, hmac_key)
+
+    assert ok is False
+    assert "MISMATCH" in reason
+
+
+def test_w4_verify_detects_added_and_removed_entries(tmp_path, hmac_key):
+    """Smuggling an extra file into the baseline, or dropping one, is detected."""
+    _folder, baseline_path = _signed_baseline(tmp_path, {"file1.txt": "one\n"}, hmac_key)
+
+    with_extra = _read_json(baseline_path)
+    with_extra["files"]["evil.txt"] = {"sha256": "1" * 64, "size": 1, "mtime": 0.0}
+    assert main.verify_baseline_signature(with_extra, hmac_key)[0] is False
+
+    with_dropped = _read_json(baseline_path)
+    with_dropped["files"].pop("file1.txt")
+    assert main.verify_baseline_signature(with_dropped, hmac_key)[0] is False
+
+
+def test_w4_verify_rejects_the_wrong_key(tmp_path):
+    """A different key of the same length does not verify."""
+    key_a = bytes.fromhex(main.generate_hmac_key())
+    key_b = bytes.fromhex(main.generate_hmac_key())
+    _folder, baseline_path = _signed_baseline(tmp_path, {"file1.txt": "one\n"}, key_a)
+
+    ok, reason = main.verify_baseline_signature(_read_json(baseline_path), key_b)
+
+    assert ok is False
+    assert "MISMATCH" in reason
+
+
+def test_w4_verify_reports_unsigned_baseline():
+    """An unsigned baseline is reported as unverifiable, never as valid."""
+    ok, reason = main.verify_baseline_signature({"files": {}}, b"k" * 32)
+    assert ok is False
+    assert "UNSIGNED" in reason
+
+
+def test_w4_verify_reports_missing_key(tmp_path, hmac_key):
+    """A signed baseline with no key configured cannot be verified."""
+    _folder, baseline_path = _signed_baseline(tmp_path, {"file1.txt": "one\n"}, hmac_key)
+
+    ok, reason = main.verify_baseline_signature(_read_json(baseline_path), None)
+
+    assert ok is False
+    assert "no HMAC key" in reason
+
+
+def test_w4_verify_uses_constant_time_comparison(tmp_path, hmac_key):
+    """hmac.compare_digest() is used rather than '==' (timing safety)."""
+    source = (Path(__file__).resolve().parent / "main.py").read_text(encoding="utf-8")
+    assert "compare_digest" in source
+
+    calls = []
+    real_compare = main.hmac.compare_digest
+
+    def spy(left, right):
+        calls.append((left, right))
+        return real_compare(left, right)
+
+    with mock.patch("main.hmac.compare_digest", side_effect=spy):
+        _folder, baseline_path = _signed_baseline(tmp_path, {"a.txt": "a\n"}, hmac_key)
+        main.verify_baseline_signature(_read_json(baseline_path), hmac_key)
+
+    assert calls, "verification must go through hmac.compare_digest"
+
+
+# ---------------------------------------------------------------------------
+# Command-level behaviour: check / watch with signatures
+# ---------------------------------------------------------------------------
+
+def test_w4_check_verifies_signature_end_to_end(tmp_path, hmac_key, capsys):
+    """`check --verify` succeeds on an authentic baseline."""
+    folder, baseline_path = _signed_baseline(tmp_path, {"file1.txt": "one\n"}, hmac_key)
+
+    exit_code = main.command_check(folder, baseline_path=baseline_path,
+                                   verify_signature=True, key=hmac_key)
+    out = capsys.readouterr().out
+
+    assert exit_code == main.EXIT_OK
+    assert "signature verified" in out
+    assert "No changes detected" in out
+
+
+def test_w4_check_refuses_a_tampered_baseline(tmp_path, hmac_key, capsys):
+    """`check --verify` exits 1 and never reports on a forged baseline."""
+    folder, baseline_path = _signed_baseline(tmp_path, {"file1.txt": "one\n"}, hmac_key)
+    data = _read_json(baseline_path)
+    data["files"]["file1.txt"]["sha256"] = "0" * 64
+    baseline_path.write_text(json.dumps(data), encoding="utf-8")
+
+    exit_code = main.command_check(folder, baseline_path=baseline_path,
+                                   verify_signature=True, key=hmac_key)
+    captured = capsys.readouterr()
+
+    assert exit_code == main.EXIT_FAILURE
+    assert "MISMATCH" in captured.err
+    assert "No changes detected" not in captured.out
+
+
+def test_w4_check_does_not_rewrite_a_tampered_baseline(tmp_path, hmac_key):
+    """Even a failed verification leaves the baseline bytes untouched."""
+    folder, baseline_path = _signed_baseline(tmp_path, {"file1.txt": "one\n"}, hmac_key)
+    data = _read_json(baseline_path)
+    data["file_count"] = 99
+    baseline_path.write_text(json.dumps(data), encoding="utf-8")
+    before = baseline_path.read_bytes()
+
+    _quiet_command(main.command_check, folder, baseline_path=baseline_path,
+                   verify_signature=True, key=hmac_key)
+
+    assert baseline_path.read_bytes() == before
+
+
+def test_w4_unsigned_baseline_is_backward_compatible(tmp_path, hmac_key, capsys):
+    """--verify warns on an unsigned baseline but still works (Weeks 1-3)."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+    baseline_path = tmp_path / "baseline.json"
+    _quiet_command(main.command_baseline, folder, baseline_path=baseline_path)
+
+    exit_code = main.command_check(folder, baseline_path=baseline_path,
+                                   verify_signature=True, key=hmac_key)
+    captured = capsys.readouterr()
+
+    assert exit_code == main.EXIT_OK
+    assert "UNSIGNED" in captured.err
+
+
+def test_w4_require_signature_refuses_unsigned(tmp_path, hmac_key, capsys):
+    """--require-signature makes an unsigned baseline a hard failure."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+    baseline_path = tmp_path / "baseline.json"
+    _quiet_command(main.command_baseline, folder, baseline_path=baseline_path)
+
+    exit_code = main.command_check(folder, baseline_path=baseline_path,
+                                   require_signature=True, key=hmac_key)
+    captured = capsys.readouterr()
+
+    assert exit_code == main.EXIT_FAILURE
+    assert "UNSIGNED" in captured.err
+
+
+def test_w4_watch_refuses_to_start_on_a_bad_signature(tmp_path, hmac_key, clean_logging):
+    """watch --require-signature will not monitor with a forged baseline."""
+    folder, baseline_path = _signed_baseline(tmp_path, {"file1.txt": "one\n"}, hmac_key)
+    data = _read_json(baseline_path)
+    data["files"]["file1.txt"]["sha256"] = "9" * 64
+    baseline_path.write_text(json.dumps(data), encoding="utf-8")
+    log_path = tmp_path / "filewatch.log"
+
+    exit_code = _quiet_command(main.command_watch, folder,
+                               baseline_path=baseline_path, interval=0,
+                               log_path=log_path, max_scans=1,
+                               require_signature=True, key=hmac_key)
+
+    assert exit_code == main.EXIT_FAILURE
+    assert "could not hash" not in _read_log(log_path).lower()
+
+
+def test_w4_watch_runs_with_a_valid_signature(tmp_path, hmac_key, clean_logging):
+    """watch --verify starts normally when the signature checks out."""
+    folder, baseline_path = _signed_baseline(tmp_path, {"file1.txt": "one\n"}, hmac_key)
+
+    exit_code = _quiet_command(main.command_watch, folder,
+                               baseline_path=baseline_path, interval=0,
+                               log_path=tmp_path / "w.log", max_scans=1,
+                               verify_signature=True, key=hmac_key)
+
+    assert exit_code == main.EXIT_OK
+
+
+def test_w4_load_baseline_defaults_are_unchanged(tmp_path):
+    """load_baseline() without the new flags behaves exactly as in Week 2/3."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+    baseline_path = tmp_path / "baseline.json"
+    _quiet_command(main.command_baseline, folder, baseline_path=baseline_path)
+
+    loaded = _quiet_command(main.load_baseline, baseline_path)
+
+    assert list(loaded) == ["file1.txt"]
+
+
+# ---------------------------------------------------------------------------
+# keygen command
+# ---------------------------------------------------------------------------
+
+def test_w4_keygen_writes_a_private_file(tmp_path, capsys):
+    """`keygen --out` writes a 0600 key file outside the project."""
+    target = tmp_path / "secrets" / "hmac.key"
+
+    exit_code = main.command_keygen(output_path=target)
+    capsys.readouterr()
+
+    assert exit_code == main.EXIT_OK
+    assert target.is_file()
+    mode = _stat.S_IMODE(target.stat().st_mode)
+    assert mode == 0o600, f"key file mode is {oct(mode)}, expected 0o600"
+    assert len(bytes.fromhex(target.read_text().strip())) >= 32
+
+
+def test_w4_keygen_refuses_to_write_inside_the_project(capsys):
+    """A key written next to the code is one `git add .` from leaking."""
+    project_root = Path(main.__file__).resolve().parent
+    target = project_root / "leaked.key"
+
+    exit_code = main.command_keygen(output_path=target)
+    captured = capsys.readouterr()
+
+    assert exit_code == main.EXIT_FAILURE
+    assert "Refusing to write a key inside the project" in captured.err
+    assert not target.exists()
+
+
+def test_w4_keygen_refuses_to_overwrite_without_force(tmp_path, capsys):
+    """An existing key file is protected unless --force is given."""
+    target = tmp_path / "hmac.key"
+    target.write_text("existing\n", encoding="utf-8")
+
+    assert main.command_keygen(output_path=target) == main.EXIT_FAILURE
+    assert target.read_text(encoding="utf-8") == "existing\n"
+
+    assert main.command_keygen(output_path=target, force=True) == main.EXIT_OK
+    assert target.read_text(encoding="utf-8").strip() != "existing"
+    capsys.readouterr()
+
+
+def test_w4_keygen_cli_prints_a_key(capsys):
+    """`main.py keygen` prints an exportable key without writing anything."""
+    assert main.main(["keygen"]) == main.EXIT_OK
+    out = capsys.readouterr().out
+
+    assert f"export {main.HMAC_KEY_ENV}=" in out
+    exported = out.split(f"export {main.HMAC_KEY_ENV}=")[1].split()[0]
+    assert len(bytes.fromhex(exported)) >= 32
+
+
+# ---------------------------------------------------------------------------
+# CLI wiring for the new flags
+# ---------------------------------------------------------------------------
+
+def test_w4_cli_parses_signing_flags():
+    """--sign, --verify, --require-signature, --key-file, --out, --force."""
+    args = main.parse_args(["baseline", "--sign"])
+    assert args.sign is True
+
+    args = main.parse_args(["check", "--require-signature"])
+    assert args.require_signature is True and args.verify is False
+
+    args = main.parse_args(["keygen", "--out", "k.key", "--force"])
+    assert args.out == "k.key" and args.force is True
+
+    args = main.parse_args(["check", "--verify", "--key-file", "/tmp/k"])
+    assert args.verify is True and args.key_file == "/tmp/k"
+
+
+def test_w4_cli_signs_and_verifies_end_to_end(tmp_path, monkeypatch, capsys):
+    """The full CLI path: baseline --sign, then check --require-signature."""
+    folder = _make_folder(tmp_path / "test_folder", {"file1.txt": "one\n"})
+    baseline_path = tmp_path / "baseline.json"
+    monkeypatch.delenv(main.HMAC_KEY_FILE_ENV, raising=False)
+    monkeypatch.setenv(main.HMAC_KEY_ENV, main.generate_hmac_key())
+
+    assert main.main(["--folder", str(folder), "--baseline", str(baseline_path),
+                      "baseline", "--sign"]) == main.EXIT_OK
+    assert main.SIGNATURE_KEY in _read_json(baseline_path)
+
+    assert main.main(["--folder", str(folder), "--baseline", str(baseline_path),
+                      "check", "--require-signature"]) == main.EXIT_OK
+    capsys.readouterr()
+
+
+# ---------------------------------------------------------------------------
+# Documented limitations, encoded as executable tests
+# ---------------------------------------------------------------------------
+#
+# These tests assert what HMAC does NOT do. They exist so the limitation is
+# verified rather than merely claimed in prose, and so nobody "fixes" a failing
+# assumption by quietly changing the documentation.
+
+def test_w4_limitation_baseline_is_not_encrypted(tmp_path, hmac_key):
+    """LIMIT: signing never encrypts - the inventory stays readable."""
+    folder = _make_folder(tmp_path / "test_folder", {
+        "secret_project/merger_agreement.pdf": "confidential\n",
+    })
+    baseline_path = tmp_path / "baseline.json"
+    _quiet_command(main.command_baseline, folder, baseline_path=baseline_path,
+                   sign=True, key=hmac_key)
+
+    raw = baseline_path.read_text(encoding="utf-8")
+
+    # The path, the algorithm and the digest are all plaintext, signature or not.
+    assert "secret_project/merger_agreement.pdf" in raw
+    assert "sha256" in raw
+    expected_digest = hashlib.sha256(b"confidential\n").hexdigest()
+    assert expected_digest in raw
+    assert main.SIGNATURE_KEY in raw
+
+    # And it still parses as ordinary JSON without any key.
+    data = json.loads(raw)
+    assert "secret_project/merger_agreement.pdf" in data["files"]
+
+
+def test_w4_limitation_stolen_key_allows_forgery(tmp_path, hmac_key):
+    """LIMIT: an attacker holding the key can forge and re-sign undetected.
+
+    This documents the boundary of the guarantee: HMAC distinguishes holders of
+    the key from non-holders, and nothing more. The forge below uses only the
+    standard library and takes no privileged access.
+    """
+    folder, baseline_path = _signed_baseline(
+        tmp_path, {"file1.txt": "original\n"}, hmac_key)
+
+    # 1. The attacker changes a monitored file.
+    (folder / "file1.txt").write_bytes(b"original\nmalware\n")
+
+    # 2. ...and rewrites the baseline to match, re-signing with the stolen key.
+    data = _read_json(baseline_path)
+    data["files"]["file1.txt"]["sha256"] = hashlib.sha256(
+        (folder / "file1.txt").read_bytes()).hexdigest()
+    data[main.SIGNATURE_KEY]["value"] = main.compute_baseline_signature(
+        data, hmac_key)
+    baseline_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    # 3. FileWatch accepts the forgery: the signature is cryptographically valid.
+    ok, reason = main.verify_baseline_signature(_read_json(baseline_path), hmac_key)
+    assert ok is True, "the forged signature is genuinely valid"
+    assert "verified" in reason
+
+    exit_code = _quiet_command(main.command_check, folder,
+                               baseline_path=baseline_path,
+                               require_signature=True, key=hmac_key)
+    assert exit_code == main.EXIT_OK, (
+        "with the key, a forged baseline passes --require-signature. This is the "
+        "documented limit of a symmetric MAC, not a bug."
+    )
+
+
+def test_w4_limitation_without_the_key_forgery_is_detected(tmp_path):
+    """The complement: an attacker WITHOUT the key cannot forge."""
+    key = bytes.fromhex(main.generate_hmac_key())
+    wrong_key = bytes.fromhex(main.generate_hmac_key())
+    folder, baseline_path = _signed_baseline(tmp_path, {"file1.txt": "original\n"}, key)
+
+    (folder / "file1.txt").write_bytes(b"original\nmalware\n")
+    data = _read_json(baseline_path)
+    data["files"]["file1.txt"]["sha256"] = hashlib.sha256(
+        (folder / "file1.txt").read_bytes()).hexdigest()
+    # The attacker guesses a key but does not have the real one.
+    data[main.SIGNATURE_KEY]["value"] = main.compute_baseline_signature(
+        data, wrong_key)
+    baseline_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    ok, reason = main.verify_baseline_signature(_read_json(baseline_path), key)
+    assert ok is False
+    assert "MISMATCH" in reason
+
+    exit_code = _quiet_command(main.command_check, folder,
+                               baseline_path=baseline_path,
+                               require_signature=True, key=key)
+    assert exit_code == main.EXIT_FAILURE
+
+
+def test_w4_limitation_rollback_cannot_be_detected(tmp_path, hmac_key):
+    """LIMIT: an old, validly-signed baseline can be replayed later.
+
+    Nothing binds a signature to "now", so restoring a stale signed baseline
+    hides everything that changed after it was taken.
+    """
+    folder, baseline_path = _signed_baseline(tmp_path, {"file1.txt": "v1\n"}, hmac_key)
+    old_signed = baseline_path.read_bytes()
+
+    # Legitimate re-baseline after a deliberate change (v2).
+    (folder / "file1.txt").write_bytes(b"v2\n")
+    _quiet_command(main.command_baseline, folder, baseline_path=baseline_path,
+                   sign=True, key=hmac_key)
+    assert not main.has_changes(
+        _quiet_command(main.compare_snapshots,
+                       _quiet_command(main.load_baseline, baseline_path),
+                       _quiet_command(main.build_snapshot, folder)))
+
+    # Attacker rolls the baseline back to the still-valid v1 signature...
+    (folder / "file1.txt").write_bytes(b"v1\n")
+    baseline_path.write_bytes(old_signed)
+
+    ok, _reason = main.verify_baseline_signature(_read_json(baseline_path), hmac_key)
+    assert ok is True, "the replayed signature is still valid"
+    # ...and the rollback is invisible: v1 matches v1.
+    exit_code = _quiet_command(main.command_check, folder,
+                               baseline_path=baseline_path,
+                               require_signature=True, key=hmac_key)
+    assert exit_code == main.EXIT_OK
+
+
+def test_w4_limitation_log_is_plaintext_and_unsigned(tmp_path, clean_logging):
+    """LIMIT: filewatch.log is not signed; it is ordinary readable text."""
+    folder, baseline_path = _baseline_for(tmp_path, {"file1.txt": "one\n"})
+    log_path = tmp_path / "filewatch.log"
+    (folder / "added.txt").write_bytes(b"new\n")
+
+    _quiet_command(main.command_watch, folder, baseline_path=baseline_path,
+                   interval=0, log_path=log_path, max_scans=1)
+
+    log_text = _read_log(log_path)
+    assert "added.txt" in log_text, "log contents are readable in plaintext"
+    # No signature/HMAC material is written to the log.
+    assert main.SIGNATURE_KEY not in log_text
+    assert "hmac" not in log_text.lower()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

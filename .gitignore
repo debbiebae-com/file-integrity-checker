@@ -51,6 +51,17 @@ arr.json
 
 # --- pytest artifacts ---
 
+# --- Week 3: runtime output from `watch` ---
+# The log is generated at runtime; never commit it.
+filewatch.log
+*.log
+!filewatch.log.template
+
+# Optional HMAC signing keys (stretch goal) must never be committed
+*.key
+*.hmac
+hmac.key
+
 # --- Temporary demonstration leftovers (should never be committed) ---
 test_folder/demo_copy_*
 

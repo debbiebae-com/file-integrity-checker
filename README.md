@@ -2,11 +2,14 @@
 
 **Week 1:** SHA-256 File Integrity Checker (hashing + avalanche demonstration)
 **Week 2:** Baseline snapshots and change detection (added / modified / deleted / unchanged)
+**Week 3:** Continuous monitoring, structured logging, ignore rules and terminal alerts
+**Week 4 (stretch):** HMAC-SHA256 signed baselines — tamper-evident reference data
 
 A beginner-friendly, standard-library-only Python tool that shows how cryptographic
 hashing is used to detect changes to files. It hashes the files in a local
-`test_folder`, saves a **baseline** of those hashes to JSON, and later compares the
-folder against that baseline to tell you exactly what changed.
+`test_folder`, saves a **baseline** of those hashes to JSON, compares the folder
+against that baseline to report exactly what changed, and can now **watch the folder
+continuously**, logging and alerting on every change until you stop it.
 
 > ### 📌 LEGAL AND ETHICAL NOTICE
 >
@@ -44,18 +47,30 @@ folder against that baseline to tell you exactly what changed.
 17. [File size and modification time (stretch goal)](#17-file-size-and-modification-time-stretch-goal)
 18. [Exit codes](#18-exit-codes)
 
+**Week 3 — continuous monitoring and alerts**
+19. [Week 3 functionality](#19-week-3-functionality)
+20. [Continuous monitoring (`watch`)](#20-continuous-monitoring-watch)
+21. [Watch interval](#21-watch-interval)
+22. [Ignore configuration (`.filewatchignore`)](#22-ignore-configuration-filewatchignore)
+23. [Structured logging](#23-structured-logging)
+24. [Terminal alerts](#24-terminal-alerts)
+25. [No false deletions: unreadable vs deleted](#25-no-false-deletions-unreadable-vs-deleted)
+26. [Clean shutdown (Ctrl+C / SIGTERM)](#26-clean-shutdown-ctrlc--sigterm)
+27. [What changed in Week 3 (and why)](#27-what-changed-in-week-3-and-why)
+28. [HMAC baseline signing (stretch goal — implemented)](#28-hmac-baseline-signing-stretch-goal--implemented)
+
 **Using and testing the project**
-19. [Technologies used](#19-technologies-used)
-20. [Installation requirements](#20-installation-requirements)
-21. [Project structure](#21-project-structure)
-22. [Step-by-step usage](#22-step-by-step-usage)
-23. [Command-line reference](#23-command-line-reference)
-24. [Example terminal output](#24-example-terminal-output)
-25. [Error handling](#25-error-handling)
-26. [Automated testing instructions](#26-automated-testing-instructions)
-27. [Manual hash verification](#27-manual-hash-verification)
-28. [Troubleshooting](#28-troubleshooting)
-29. [Roadmap and responsible use](#29-roadmap-and-responsible-use)
+29. [Technologies used](#29-technologies-used)
+30. [Installation requirements](#30-installation-requirements)
+31. [Project structure](#31-project-structure)
+32. [Step-by-step usage](#32-step-by-step-usage)
+33. [Command-line reference](#33-command-line-reference)
+34. [Example terminal output](#34-example-terminal-output)
+35. [Error handling](#35-error-handling)
+36. [Automated testing instructions](#36-automated-testing-instructions)
+37. [Manual hash verification](#37-manual-hash-verification)
+38. [Troubleshooting](#38-troubleshooting)
+39. [Roadmap and responsible use](#39-roadmap-and-responsible-use)
 
 ---
 
@@ -527,7 +542,592 @@ A monitor that finds a problem should not report "success", so this is intention
 (`argparse` also uses `2` for usage errors; the printed message makes clear which
 case occurred.)
 
-## 19. Technologies used
+## 19. Week 3 functionality
+
+Week 3 turns the one-shot checker into a **monitor**. Everything from Weeks 1
+and 2 still works exactly as before; Week 3 adds four capabilities on top.
+
+| Feature | Description |
+|---|---|
+| `watch` command | Scans the folder continuously until interrupted, reusing `build_snapshot()` and `compare_snapshots()` |
+| `--interval SECONDS` | How long to wait between scans (default `5`, `0` = back-to-back, negatives rejected) |
+| Structured logging | `logging` module, `filewatch.log`, timestamped lines, one handler per run |
+| `.filewatchignore` | `fnmatch` patterns (`*.tmp`, `.git`, `.venv`, `__pycache__`, ...) applied to `baseline`, `check` **and** `watch` |
+| Terminal alerts | Coloured, labelled ADDED / MODIFIED / DELETED blocks with relative paths |
+| Robust errors | `PermissionError`, `OSError`, and files vanishing mid-scan are logged, never fatal |
+| No false deletions | An unreadable file is **never** reported as deleted unless it is provably gone |
+| Clean shutdown | `Ctrl+C` and `SIGTERM` exit with code 130, no traceback |
+
+## 20. Continuous monitoring (`watch`)
+
+```bash
+python3 main.py watch                  # monitor every 5 seconds
+python3 main.py watch --interval 2     # monitor every 2 seconds
+python3 main.py watch --once           # a single scan, then exit (cron/CI)
+```
+
+What happens:
+
+1. `filewatch.log` is opened and structured logging starts.
+2. `baseline.json` is loaded **once** (a missing baseline aborts with a clear
+   message and exit code 1 — `watch` will not invent one).
+3. `.filewatchignore` is loaded and compiled.
+4. A loop: `scan_once()` → snapshot the folder → compare with the reference →
+   alert + log any changes → sleep `interval` → repeat.
+5. `Ctrl+C` logs "interrupted by user", prints a friendly line, exits `130`.
+
+```
+==========================================================================
+                    FILEWATCH - CONTINUOUS MONITORING
+==========================================================================
+Folder    : /home/user/file-integrity-checker/test_folder
+Baseline  : /home/user/file-integrity-checker/baseline.json
+Algorithm : SHA-256
+Interval  : 2 second(s)
+Log file  : filewatch.log
+Ignore    : 26 pattern(s) from /home/user/file-integrity-checker/.filewatchignore
+--------------------------------------------------------------------------
+Press Ctrl+C to stop.
+Baseline loaded: 12 file(s).
+==========================================================================
+[16:25:07] scan 1: no changes (12 file(s) monitored)
+[16:25:09] scan 2: no changes (12 file(s) monitored)
+
+FILEWATCH ALERT  2026-11-24 16:25:11
+
+  [+] ADDED (1)
+      + added.txt
+      size: 18 B  mtime: 2026-11-24 16:25:10
+
+  [~] MODIFIED (1)
+      ~ subfolder/file9.txt
+      sha256: 79d63b7f0d03ce2c958bc4cb89baad3c11746e2a55ed86d4549e9b7e09227d6a
+
+  [-] DELETED (1)
+      - file6.txt
+      last known sha256: 6c646211e6da710b673b02a0eff9360460ce9d35ce41e2671a390c4b7211dcb5
+
+[16:25:13] scan 4: no changes (12 file(s) monitored)
+^C
+[stopped] Monitoring stopped by user after 4 scan(s).
+Log written to filewatch.log.
+```
+
+### Alert each change once (default)
+
+`watch` keeps an **in-memory reference** that advances after a change has been
+alerted, so a file that stays modified does not re-alert on every scan. The
+reference lives in RAM only: **`baseline.json` on disk is never written by
+`watch`**, which preserves the approved Week 2 rule that a monitor must never
+silently move its own reference point.
+
+To keep re-alerting for as long as a difference exists (closer to a "current
+state" view), pass `--repeat-alerts`.
+
+## 21. Watch interval
+
+| Value | Meaning |
+|---|---|
+| `--interval 5` | one scan every 5 seconds (default) |
+| `--interval 0.5` | twice a second |
+| `--interval 0` | scan back-to-back with no sleep (used by the tests; CPU-heavy) |
+| `--interval -1` | rejected with exit code 1 |
+
+The interval is a *polling* interval, not a filesystem-notification interval:
+each scan re-reads and re-hashes every monitored file. That is simple, portable
+and needs no extra dependencies. For very large folders, prefer a longer interval
+(30–300 s) — the cost of a scan grows with total folder size, not with the number
+of changes.
+
+## 22. Ignore configuration (`.filewatchignore`)
+
+A plain-text file at the project root (next to `main.py`) lists patterns that
+must never be reported. One pattern per line; `#` starts a comment.
+
+```
+# .filewatchignore (shipped excerpt)
+*.tmp
+__pycache__
+.venv
+.git
+*.log
+```
+
+### Matching rules
+
+Patterns are matched with `fnmatch` against:
+
+* the **full relative path** — `subfolder/notes.tmp`
+* the **file name** — `notes.tmp`
+* **every parent folder name** — `__pycache__`, `.git`, `.venv`
+
+So `*.tmp` matches at any depth, and a bare folder name such as `.venv` matches
+`a/b/.venv/lib/python3/site.py`. Matching is **case-sensitive** on all platforms
+for predictable behaviour. Negation patterns (`!keep.txt`) are **not**
+supported — that would need a full `.gitignore` engine.
+
+### Where the rules apply
+
+| Command | Ignore rules applied? |
+|---|---|
+| `baseline` | Yes — ignored files never enter `baseline.json` |
+| `check` | Yes — consistent with `baseline` |
+| `watch` | Yes — ignored files never alert |
+
+This consistency matters: if `baseline` recorded a file that `watch` ignores (or
+vice versa) the tool would report phantom changes forever.
+
+### Built-in patterns
+
+A few patterns are **always** active, even without a config file, so the tool
+never alerts about its own output: `filewatch.log`, `baseline.json.tmp`,
+`*.json.tmp`, `__pycache__`, `*.pyc`, `*.pyo`.
+
+### Ignored directories are pruned
+
+Ignored directories are removed from the walk *before* `os.walk` descends into
+them, so an ignored `.git` or `.venv` is never entered at all. That keeps scans
+fast and prevents a huge dependency tree from dominating the runtime.
+
+Custom file: `python3 main.py check --ignore my-rules.txt`
+
+## 23. Structured logging
+
+`watch` writes to `filewatch.log` (override with `--log PATH`) using Python's
+standard `logging` module:
+
+```
+2026-11-24 16:25:07 | INFO     | filewatch | Watch started: folder=/.../test_folder algorithm=sha256 interval=2.0s files=12 patterns=26
+2026-11-24 16:25:11 | WARNING  | filewatch | ADDED file: added.txt
+2026-11-24 16:25:11 | WARNING  | filewatch | MODIFIED file: subfolder/file9.txt
+2026-11-24 16:25:11 | WARNING  | filewatch | DELETED file: file6.txt
+2026-11-24 16:25:11 | ERROR    | filewatch | Unreadable file (content unknown, not reported as deleted): locked.txt
+2026-11-24 16:25:11 | INFO     | filewatch | Scan 4: no changes (12 file(s))
+2026-11-24 16:25:19 | INFO     | filewatch | Watch interrupted by user after 4 scan(s).
+2026-11-24 16:25:19 | INFO     | filewatch | Watch ended: scans=4 exit_code=130
+```
+
+Format: `timestamp | level | logger name | message`.
+
+| Level | Used for |
+|---|---|
+| `INFO` | start/stop, scan counters, the end-of-run summary |
+| `WARNING` | every detected ADDED / MODIFIED / DELETED change |
+| `ERROR` | files that could not be read or hashed, startup failures |
+| `DEBUG` | per-skip detail (ignored/symlinked entries); enable with `--verbose` |
+
+### No duplicate handlers
+
+`setup_logging()` tags the handlers it creates with `_filewatch_managed = True`
+and removes any previously tagged handler before adding a new one. Calling it
+repeatedly (a watch loop, a test, an embedded use) therefore cannot duplicate
+log lines. Tagged-handler removal deliberately leaves **foreign** handlers alone,
+so pytest's `caplog` and your own handlers keep working. The logger also sets
+`propagate = False`, so embedding FileWatch cannot pollute the root logger.
+
+If the log file cannot be opened (read-only volume, bad path), a warning is
+printed and monitoring continues with console alerts only — logging is never the
+reason the tool fails.
+
+## 24. Terminal alerts
+
+Each change category gets its own labelled block, and every entry shows the
+**relative path** so alerts are unambiguous across subfolders:
+
+```
+FILEWATCH ALERT  2026-11-24 16:25:11
+
+  [+] ADDED (2)
+      + added.txt
+      size: 18 B  mtime: 2026-11-24 16:25:10
+      + subfolder/new_file.txt
+      size: 6 B  mtime: 2026-11-24 16:25:10
+
+  [~] MODIFIED (1)
+      ~ file1.txt
+      sha256: 28d7ee908b2ef37d72d0ebaf04dc3dfb7613c58c086ee5e986f81ecbff495312
+
+  [-] DELETED (1)
+      - file6.txt
+      last known sha256: 6c646211e6da710b673b02a0eff9360460ce9d35ce41e2671a390c4b7211dcb5
+```
+
+Colours: green `+` for added, yellow `~` for modified, red `-` for deleted,
+magenta `!` for unreadable. Colour is **auto-detected** and automatically
+disabled when:
+
+* the output is not a TTY (piped to a file, captured by a test),
+* the `NO_COLOR` environment variable is set (<https://no-color.org>),
+* `TERM=dumb`.
+
+No dependency such as `colorama` is needed; ANSI codes are plain strings and the
+Windows 10+ console understands them.
+
+## 25. No false deletions: unreadable vs deleted
+
+This is the subtlest Week 3 requirement, and the easiest to get wrong.
+
+**The problem.** Suppose `secret.txt` is in the baseline, and during a scan the
+tool cannot read it (permission revoked, ACL changed, file locked on Windows). A
+naive comparison sees "in baseline, not in the new snapshot" and shouts
+**DELETED** — a false alarm that could send you chasing an incident that never
+happened.
+
+**What FileWatch does.**
+
+1. `build_snapshot(..., unreadable=set())` records the relative path of every
+   file it could not hash in that set. Unreadable is *not* the same as missing.
+2. `compare_snapshots(baseline, current, unreadable=..., root=...)` computes
+   `deleted = (baseline − current) − unreadable`, so a file we failed to read
+   never enters the deleted bucket.
+3. Those paths are reported in a separate **UNREADABLE** bucket instead:
+
+   ```
+     [!] UNREADABLE (1) - not reported as deleted
+       ! locked.txt
+   ```
+4. As a second safety net the tool asks the filesystem directly with
+   `os.path.lexists()`. Only if the path is **provably gone** does it become a
+   genuine deletion; if it still exists in any form, it stays unreadable.
+5. Every unreadable file is logged at `ERROR` level, so nothing is hidden.
+
+`has_changes()` ignores the unreadable bucket, so an unreadable file alone does
+not make `check` exit with code 2 or `watch` claim a change. It is surfaced, but
+not misreported.
+
+## 26. Clean shutdown (Ctrl+C / SIGTERM)
+
+```bash
+python3 main.py watch
+# ...
+^C
+[stopped] Monitoring stopped by user after 4 scan(s).
+Log written to filewatch.log.
+```
+
+* `KeyboardInterrupt` is caught inside the loop: no traceback, exit code **130**
+  (128 + `SIGINT`, the conventional code).
+* The shutdown is logged (`Watch interrupted by user after N scan(s)`), and a
+  `finally` block always writes the end-of-run summary.
+* `SIGTERM` (plain `kill`, most service managers) is translated into the same
+  clean path by a small handler installed in `__main__`. Only `SIGTERM` is
+  touched; `SIGINT` already raises `KeyboardInterrupt`.
+* `os._exit()` is never used, so buffered log lines are flushed and handlers
+  closed normally.
+
+## 27. What changed in Week 3 (and why)
+
+Incremental, backward-compatible changes only — every Week 1/2 signature still
+works, and all 36 original `unittest` tests pass unmodified.
+
+| File | Change | Why |
+|---|---|---|
+| `main.py` | **New** Week 3 sections: `setup_logging`, `IgnoreRules`, `scan_once`, `advance_reference`, `format_alerts`, `command_watch` | The four new capabilities |
+| `main.py` | `walk_regular_files(folder, ignore=None)` | Ignore rules must be applied during the walk (and prune ignored directories) — added as an **optional** argument so old calls are untouched |
+| `main.py` | `build_snapshot(..., ignore=None, unreadable=None, report_skipped=True)` | Same reason; `unreadable` lets callers distinguish "missing" from "unreadable" |
+| `main.py` | `compare_snapshots(..., unreadable=None, root=None)` + new `unreadable` result key | Prevents false DELETED reports (section 25). Old calls behave identically |
+| `main.py` | `walk` now catches `OSError`/`PermissionError` from `os.walk` and per-entry `stat` calls | A failing tree must not abort a scan (found by a test) |
+| `main.py` | `command_baseline` / `command_check` accept `ignore_path` and apply the same rules as `watch` | Consistency across commands; without it, ignored files could still trigger alerts |
+| `main.py` | CLI: `watch` command, `--interval`, `--log`, `--ignore`, `--once`, `--verbose`, `--repeat-alerts` | New options, all optional |
+| `main.py` | `__main__` block installs a `SIGTERM` handler | Clean shutdown under `kill`/systemd |
+| `.filewatchignore` | **New file** | Default ignore patterns (`*.tmp`, `.git`, `.venv`, `__pycache__`, logs, editor/O​S noise) |
+| `test_main.py` | **40 new tests** (Week 3), existing 63 untouched | Monitoring, ignore rules, errors, logging, alerts, shutdown |
+| `.gitignore` | Ignores `filewatch.log`, `*.log`, alternate baselines | Runtime output stays out of Git |
+| `README.md` | Week 3 sections 19–28 added, later sections renumbered | Documentation |
+| `baseline.json` | Regenerated with ignore rules active | Same 12 sample files, no behaviour change |
+
+Nothing was removed, renamed or rewritten for its own sake: Week 1's `hash_file`,
+`monitor_folder` and demonstration, and Week 2's `build_snapshot` (without new
+arguments) and `compare_snapshots` (without new arguments) behave exactly as
+approved.
+
+## 28. HMAC baseline signing (stretch goal — implemented)
+
+**Status: implemented and tested** (36 dedicated tests). It was built only after
+all Week 3 core requirements were complete and green.
+
+> ### Read this first - two limits that define what HMAC does
+>
+> **1. HMAC does not encrypt anything.** `baseline.json` stays plaintext JSON.
+> Every monitored path, every SHA-256 digest, every file size, every timestamp,
+> and the folder name are readable by anyone who can open the file. HMAC proves
+> *who wrote it*; it hides *nothing*.
+>
+> **2. HMAC does not help once the key is stolen.** The signature proves the
+> baseline was signed by a holder of the key - and an attacker holding the key
+> **is** a valid holder. They can edit a file, rewrite the baseline, compute a
+> fresh signature, and FileWatch will report `signature verified` with no
+> changes detected. This was demonstrated here, not assumed (see
+> [the two hard limits](#the-two-hard-limits-honestly)).
+>
+> If either limit matters for your threat model, HMAC alone is not enough: see
+> [What would actually be needed](#what-would-actually-be-needed).
+
+### The gap this closes
+
+FileWatch verifies *files* against `baseline.json`. But `baseline.json` is itself
+just a file. An attacker who can edit a monitored file can edit the baseline to
+match it, and `check` will happily say "no changes":
+
+```bash
+echo "malware" >> test_folder/app.py       # 1. change the file
+# 2. ...and rewrite baseline.json so the hash matches again
+python3 main.py check                      # "No changes detected" — undetected!
+```
+
+An **HMAC signature** binds the baseline to a secret key. Without the key the
+baseline cannot be quietly rewritten; changing any byte invalidates the
+signature, and `check --verify` refuses to trust it.
+
+### What it does and does not protect
+
+| Protects against | Does **not** protect against |
+|---|---|
+| Silent edits to `baseline.json` (any field, any entry) | An attacker who already has the key |
+| A forged baseline copied in from elsewhere | An attacker running code as your user (they can re-sign) |
+| Accidental hand-editing / truncation of the baseline | Deletions inside the monitored folder (different problem) |
+| An unsigned baseline being passed off as trustworthy | A compromised machine or logging system |
+
+Signing authenticates the **baseline**, not your whole system. It is one layer,
+not a solution.
+
+### The signature format
+
+`baseline --sign` adds one block to the JSON:
+
+```json
+{
+  "tool": "FileWatch - File Integrity Monitor",
+  "schema_version": 2,
+  "algorithm": "sha256",
+  "folder": "test_folder",
+  "created_utc": "2026-11-25T09:04:20Z",
+  "file_count": 12,
+  "files": { "file1.txt": { "sha256": "ae51...", "size": 155, "mtime": 1795... } },
+  "signature": {
+    "algorithm": "hmac-sha256",
+    "value": "1e030c06886653abf6be9c7f49023ed0dfae54509369310b897cae89fd850ffb",
+    "signed_fields": ["algorithm", "created_utc", "file_count", "files",
+                      "folder", "schema_version", "tool"]
+  }
+}
+```
+
+How it is computed:
+
+```python
+payload = json.dumps(signed_part, sort_keys=True, separators=(",", ":"))
+value   = hmac.new(key, payload.encode("utf-8"), hashlib.sha256).hexdigest()
+```
+
+* everything except `signature` and `signed_fields` is signed — including every
+  per-file hash, the algorithm, and the file count;
+* `sort_keys=True` + fixed separators make the payload **deterministic**, so
+  re-indenting or reordering the JSON does not break verification, while any
+  change of *value* does;
+* verification uses `hmac.compare_digest()` — constant time, so a timing side
+  channel cannot leak how much of the digest matched.
+
+### Using it
+
+```bash
+# 1. Generate a key (never hardcoded, never inside the project)
+python3 main.py keygen
+#   export FILEWATCH_HMAC_KEY=85f9c59192f963d8...
+# or write it to a 0600 file outside the repo:
+python3 main.py keygen --out ~/.config/filewatch/hmac.key
+
+# 2. Load the key
+export FILEWATCH_HMAC_KEY=85f9c59192f963d8...        # from a secrets manager
+# or
+export FILEWATCH_HMAC_KEY_FILE=~/.config/filewatch/hmac.key
+
+# 3. Sign the baseline
+python3 main.py baseline --sign
+#   Signature : hmac-sha256 (1e030c06886653ab...)
+
+# 4. Verify on every check
+python3 main.py check --verify
+#   Signature : signature verified (hmac-sha256)
+#   No changes detected. Folder integrity verified.
+```
+
+| Flag | Applies to | Meaning |
+|---|---|---|
+| `--sign` | `baseline` | Sign the baseline with HMAC-SHA256 |
+| `--verify` | `check`, `watch` | Check the signature; warn (not fail) if unsigned |
+| `--require-signature` | `check`, `watch` | Refuse an unsigned baseline (implies `--verify`) |
+| `--key-file PATH` | all | Load the key from this 0600 file |
+| `keygen [--out PATH] [--force]` | command | Generate a random key; optionally write it 0600 |
+
+### Refusal behaviour (fail closed)
+
+Nothing about signing is "best effort" — if it cannot be done safely, it is not
+done at all:
+
+| Situation | Result |
+|---|---|
+| `baseline --sign` with no key configured | Exit 1, **baseline not written** |
+| `baseline --sign` with a key shorter than 32 bytes | Exit 1, baseline not written, previous baseline preserved |
+| Signature mismatch (baseline edited) | Exit 1, baseline **not** loaded, `check`/`watch` stop |
+| Signed baseline, no key to verify with | Exit 1, clear message |
+| Unsigned baseline + `--verify` | Warning, then continues (backward compatible) |
+| Unsigned baseline + `--require-signature` | Exit 1 |
+| Key file readable by group/others (`0644`) | Exit 1, "too permissive; run chmod 600" |
+| `keygen --out` inside the project folder | Exit 1, nothing written |
+| `keygen --out` over an existing key | Exit 1 unless `--force` |
+
+A failed verification never rewrites or repairs the baseline — same principle as
+Week 2's "a check must never move its own reference point".
+
+### Safe key management (the rules this implementation enforces)
+
+1. **Never hardcode a key.** There is no default key and no key in the source;
+   a test (`test_w4_no_hardcoded_key_in_the_source`) asserts no 64+ hex literal
+   exists in `main.py`.
+2. **Key from the environment or a private file**, resolved in this order:
+   explicit argument → `--key-file` → `$FILEWATCH_HMAC_KEY_FILE` →
+   `$FILEWATCH_HMAC_KEY`. `FILEWATCH_HMAC_KEY` accepts hex (recommended) or a
+   raw passphrase; hex is decoded as bytes.
+3. **At least 32 bytes of entropy** (the HMAC-SHA256 output length). Shorter
+   keys are rejected. `keygen` uses `secrets.token_hex(32)`.
+4. **Key file mode 0600.** Anything group/world readable is refused, because a
+   leaked baseline signature key defeats the whole mechanism.
+5. **Keep the key outside the repository.** `keygen --out` refuses to write
+   inside the project, and `.gitignore` already ignores `*.key`, `*.hmac`,
+   `hmac.key`, `.env`.
+6. **Constant-time comparison** via `hmac.compare_digest()`, never `==`.
+7. **Fail closed.** A missing key never silently downgrades to "unsigned".
+8. **Rotate on suspicion.** Re-run `keygen` and `baseline --sign`; a new key
+   invalidates signatures made with the old one.
+
+> If the key leaks, the signature guarantees nothing. Treat it like a password:
+> store it in a password manager or secrets manager, not in a shell history you
+> share, and not in the repo.
+
+### The two hard limits, honestly
+
+#### Limit 1 - no confidentiality
+
+`baseline.json` is ordinary JSON. There is no encryption anywhere in FileWatch
+(`grep -cE "AES|Fernet|cipher|encrypt" main.py` returns `0`). Opening the file
+reveals:
+
+```json
+{
+  "folder": "test_folder",
+  "created_utc": "2026-11-25T09:05:17Z",
+  "files": {
+    "documents/nested/deep.txt": { "sha256": "12e62798...", "size": 160, "mtime": 1795... },
+    "file1.txt":                 { "sha256": "ae510d7c...", "size": 155, "mtime": 1795... }
+  }
+}
+```
+
+That is a **file inventory**: names, directory layout, sizes, modification times
+and content fingerprints. For a personal project that is harmless; in an
+organisation it can leak that a folder contains `merger_agreement_2026.pdf` or
+`incident_report_final.docx`, when it was last touched and how big it is -
+regardless of what the file contains.
+
+A signature makes that content **tamper-evident**, not **secret**. Confidentiality
+and authenticity are independent properties; HMAC provides only the second.
+
+#### Limit 2 - a stolen key ends the guarantee
+
+The forgery is trivial, and was verified in this project's sandbox:
+
+```console
+$ echo "malware" >> test_folder/file1.txt          # 1. change the file
+$ python3 forge.py                                 # 2. rewrite + re-sign
+attacker rewrote + re-signed the baseline with the stolen key
+
+$ python3 main.py check --require-signature
+  Signature : signature verified (hmac-sha256)
+No changes detected. Folder integrity verified.      <- the forgery is accepted
+```
+
+where `forge.py` is four lines of standard library - recompute the file's hash,
+drop it into `files`, recompute the HMAC over the same canonical payload, write
+it back:
+
+```python
+import json, hmac, hashlib, os
+d = json.load(open("baseline.json"))
+d["files"]["file1.txt"]["sha256"] = hashlib.sha256(
+    open("test_folder/file1.txt", "rb").read()).hexdigest()
+payload = json.dumps({k: v for k, v in d.items()
+                      if k not in ("signature", "signed_fields")},
+                     sort_keys=True, separators=(",", ":")).encode()
+d["signature"]["value"] = hmac.new(
+    bytes.fromhex(os.environ["FILEWATCH_HMAC_KEY"]), payload,
+    hashlib.sha256).hexdigest()
+json.dump(d, open("baseline.json", "w"), indent=2)
+```
+
+`--require-signature` did exactly what it promises: it verified a signature that
+really was produced with the right key. There is **no cryptographic flaw** here -
+the **key model itself is the limit**. A symmetric MAC can only distinguish
+"someone with the key" from "someone without it"; it cannot tell *which* key
+holder, and it cannot help if the holder is the attacker.
+
+Consequences worth stating plainly:
+
+* The attacker needs no exploit, no privilege escalation and no FileWatch bug -
+  only the key material.
+* The forgery happens **entirely off-line**. FileWatch never runs during it, so
+  nothing is logged, alerted or timestamped.
+* It is **not detectable after the fact** by FileWatch: the forged baseline is
+  indistinguishable, byte for byte, from a legitimate one.
+* A file deleted from the monitored folder can likewise be removed from a forged
+  baseline, hiding the deletion.
+
+#### Further limits
+
+* **Rollback / replay.** A previously valid, validly-signed baseline can be put
+  back later; nothing binds a signature to "now".
+* **The log is not protected.** `filewatch.log` is plaintext and unsigned; an
+  attacker who can edit files can edit it too.
+* **No key-id or rotation scheme.** Re-signing with a new key invalidates old
+  signatures, with no way to tell "rotated" from "forged".
+* **Anyone who can run code as you wins.** They can read the key from your
+  environment, or simply re-sign. HMAC cannot defend an already-compromised host.
+
+### What would actually be needed
+
+Neither limit is fixable by "more HMAC". Each needs a different mechanism:
+
+| Goal | Mechanism | Trade-off |
+|---|---|---|
+| **Confidentiality** - hide the inventory | Encrypt `baseline.json` (AES-GCM or `cryptography.fernet`) with a *separate* key | Becomes unreadable to humans; needs a third-party dependency; still fails once that key leaks |
+| **Authenticity against key theft** | Asymmetric signature - sign with an Ed25519 **private** key, verify with a **public** key held elsewhere | The verifier only needs the public key, so stealing the verifier cannot forge; more moving parts and key distribution |
+| **Tamper evidence you cannot forge locally** | Append signatures to a system you do not control (remote log, SIEM, WORM storage, RFC 3161 timestamp authority) | Needs infrastructure and network; contradicts this project's local-only scope |
+| **Anti-rollback** | Anchor each signature in an external monotonic record or trusted timestamp | Same infrastructure requirement |
+
+Two of these are within reach as future work. Both would break the current
+"standard library only, local only" constraint, so they are documented rather
+than implemented:
+
+* **Encrypt the baseline** with `cryptography`'s `Fernet`/AES-GCM, key from a
+  secrets manager, decrypted in memory only.
+* **Switch to Ed25519 signatures**: `baseline --sign` uses the private key,
+  `check --verify` uses a public key that can be distributed openly. This removes
+  the "stolen key = game over" property - the single most valuable upgrade for a
+  real deployment.
+
+**Mitigations available today, with the current code:**
+
+1. Keep the key **out of the monitored folder and out of the repo** (enforced).
+2. Store it in a secrets manager / OS keyring, not shell history or a committed
+   `.env`.
+3. Rotate the key on any suspicion, then `baseline --sign` again.
+4. Treat `baseline.json` as **public information**: if the file *names* are
+   sensitive, do not put them in a monitored folder.
+5. Keep an **offline copy** of the baseline (or its signature) somewhere the
+   attacker cannot write, and compare occasionally - this catches forgeries that
+   would otherwise look legitimate.
+
+## 29. Technologies used
 
 * **Python 3.9+** (developed and tested on Python 3.13)
 * **`hashlib`** — SHA-256 / SHA-1 digests
@@ -537,13 +1137,20 @@ case occurred.)
 * **`argparse`** — CLI with commands and validated options
 * **`datetime`** — human-readable metadata timestamps
 * **`shutil`, `tempfile`** — safe copies and isolated tests
+* **`logging`** — structured logging to `filewatch.log` (Week 3)
+* **`fnmatch`** — ignore-pattern matching (Week 3)
+* **`time`** — polling interval in the watch loop (Week 3)
+* **`signal`** — clean `SIGTERM` shutdown (Week 3)
+* **`hmac`** — HMAC-SHA256 baseline signatures (Week 4)
+* **`secrets`** — cryptographically secure key generation (Week 4)
+* **`stat`** — enforcing `0600` on key files (Week 4)
 * **`unittest` + `unittest.mock`** — Week 1 test suite
-* **`pytest`** — Week 2 test suite (`tmp_path` fixture)
+* **`pytest`** — Week 2/3 test suites (`tmp_path` fixture)
 
 The **program itself uses only the standard library**. `pytest` is needed only to
 run the tests.
 
-## 20. Installation requirements
+## 30. Installation requirements
 
 **To run the tool:**
 
@@ -571,16 +1178,18 @@ No `pip install` is required.
   `unittest` **only if** the pytest import succeeds — so install pytest (or skip the
   file) when running the Week 2 tests.
 
-## 21. Project structure
+## 31. Project structure
 
 ```
 file-integrity-checker/
 │
-├── main.py                 # FileWatch: hashing, snapshot, baseline, check, demo
+├── main.py                 # FileWatch: hashing, snapshot, baseline, check, watch, demo
 ├── baseline.json           # Saved SHA-256 baseline (sample, committed)
+├── .filewatchignore        # Week 3: ignore patterns for scan/check/watch
+├── filewatch.log           # Week 3: created at runtime by `watch` (git-ignored)
 ├── README.md               # This document
-├── test_main.py            # Week 1 unittest suite + Week 2 pytest suite
-├── .gitignore              # Keeps caches, demo leftovers and secrets out of Git
+├── test_main.py            # Week 1 unittest + Week 2/3 pytest suites (103 tests)
+├── .gitignore              # Keeps caches, logs, demo leftovers and secrets out of Git
 │
 └── test_folder/            # The only folder this tool ever monitors
     ├── file1.txt
@@ -600,7 +1209,7 @@ file-integrity-checker/
             └── deep.txt
 ```
 
-## 22. Step-by-step usage
+## 32. Step-by-step usage
 
 1. **Unzip and enter the project**
 
@@ -654,10 +1263,35 @@ file-integrity-checker/
    # or simply re-download the ZIP
    ```
 
-8. **Run the tests**
+8. **Start continuous monitoring (Week 3)**
 
    ```bash
-   python3 -m pytest -v          # Week 2 (recommended)
+   python3 main.py watch             # every 5 seconds
+   python3 main.py watch --interval 2
+   ```
+
+   In a second terminal, change a file and watch the alert appear:
+
+   ```bash
+   echo "hello" > test_folder/new.txt
+   echo "edit" >> test_folder/file1.txt
+   rm test_folder/file5.txt
+   ```
+
+   Stop with `Ctrl+C`. Inspect `filewatch.log` afterwards for the full history.
+
+9. **Try the ignore rules**
+
+   ```bash
+   echo noise > test_folder/scratch.tmp     # ignored: *.tmp
+   mkdir -p test_folder/.git                # ignored: .git
+   python3 main.py check                    # still "No changes detected"
+   ```
+
+10. **Run the tests**
+
+   ```bash
+   python3 -m pytest -v          # Week 1-3 (recommended)
    python3 -m unittest -v        # Week 1 (built in)
    ```
 
@@ -671,7 +1305,7 @@ file-integrity-checker/
 > Tip: practise steps 4–6 in a **copy** of the project so the shipped sample files
 > stay clean.
 
-## 23. Command-line reference
+## 33. Command-line reference
 
 ```bash
 # --- Week 1 ---
@@ -687,13 +1321,32 @@ python3 main.py check --algorithm sha1 # compare SHA-1 baselines
 python3 main.py baseline --baseline other.json
 python3 main.py --folder /path/to/dir check
 
+# --- Week 3: continuous monitoring ---
+python3 main.py watch                       # monitor every 5 seconds
+python3 main.py watch --interval 2          # every 2 seconds
+python3 main.py watch --interval 0          # scan back-to-back (test/CPU stress)
+python3 main.py watch --once                # one scan then exit (cron/CI)
+python3 main.py watch --log my.log          # different log file
+python3 main.py watch --ignore rules.txt    # different ignore file
+python3 main.py watch --verbose             # DEBUG detail in the log
+python3 main.py watch --repeat-alerts       # re-alert while a change persists
+
+# --- Week 4 (stretch): HMAC-signed baselines ---
+python3 main.py keygen                              # print a new random key
+python3 main.py keygen --out ~/.config/fw/hmac.key  # write a 0600 key file
+python3 main.py baseline --sign                     # sign the baseline
+python3 main.py check --verify                      # verify, warn if unsigned
+python3 main.py check --require-signature           # refuse unsigned baselines
+python3 main.py watch --require-signature           # monitor only a signed baseline
+python3 main.py check --key-file ~/.config/fw/hmac.key
+
 # --- Help ---
 python3 main.py --help
 ```
 
 Windows equivalents use `python` instead of `python3`.
 
-## 24. Example terminal output
+## 34. Example terminal output
 
 ### Unchanged folder
 
@@ -793,7 +1446,7 @@ usage: main.py [-h] [--demo] [--algorithm NAME] [--folder PATH] [--baseline PATH
 main.py: error: unsupported algorithm 'md5'. Choose one of: sha256, sha1
 ```
 
-## 25. Error handling
+## 35. Error handling
 
 Integrity checks run against real disks, where files disappear, permissions get
 revoked, and drives fail. **One bad file never stops a scan, and a failure never
@@ -813,7 +1466,22 @@ silently destroys your baseline.**
 | Can't write the baseline | Error printed, temp file cleaned up, exit 1 |
 | Baseline written with other algorithm | Warning printed; affected files listed as SKIPPED |
 | Unsupported algorithm name | `ValueError` from `hash_file()`, argparse error with exit 2 |
-| `Ctrl+C` | `Interrupted by user.`, exit 130 |
+| `Ctrl+C` / `SIGTERM` | `[stopped] Monitoring stopped by user...`, exit 130, no traceback |
+| Unreadable file during `watch` | Logged at `ERROR`, listed under UNREADABLE, **not** reported as deleted, loop continues |
+| File vanishes mid-scan | Logged, treated as unreadable rather than a false deletion |
+| `os.walk` raises `OSError` | Logged, scan returns what it collected so far, monitoring continues |
+| Ignored directory unreadable | Pruned before descent, so it is never a problem |
+| Log file cannot be opened | Warning printed, monitoring continues with console alerts |
+| `watch` without a baseline | Clear error, exit 1, **no** baseline created |
+| `--interval` negative | Clear error, exit 1 |
+| `.filewatchignore` unreadable | Warning logged, built-in patterns still apply |
+| `--sign` with no key / short key | Exit 1, baseline **not** written (never silently unsigned) |
+| Baseline signature mismatch | Exit 1, baseline rejected, `check`/`watch` stop |
+| Signed baseline, no key configured | Exit 1, tells you to set `FILEWATCH_HMAC_KEY` |
+| Unsigned baseline with `--verify` | Warning only (Weeks 1–3 keep working) |
+| Unsigned baseline with `--require-signature` | Exit 1 |
+| Key file mode `0644` | Exit 1, "too permissive; run chmod 600" |
+| `keygen --out` inside the project | Exit 1, nothing written |
 
 Notes:
 
@@ -825,7 +1493,7 @@ Notes:
   crash mid-write cannot corrupt an existing good baseline.
 * `check` never writes anything, by design.
 
-## 26. Automated testing instructions
+## 36. Automated testing instructions
 
 Both suites live in `test_main.py` and neither touches the real sample files —
 everything runs in temporary directories (`tempfile.TemporaryDirectory` for the
@@ -845,8 +1513,11 @@ python3 test_main.py
 Expected result:
 
 ```
-63 passed, 6 subtests passed
+144 passed, 6 subtests passed
 ```
+
+(63 Week 1/2 tests + 40 Week 3 tests + 36 Week 4 HMAC tests + 5 tests that
+encode the documented HMAC limitations.)
 
 Coverage map — Week 2 specification:
 
@@ -873,7 +1544,33 @@ empty file, chunked large file, missing/unreadable files, empty folder, director
 skipping, symlink skipping, folder boundaries, demo safety, temp cleanup, algorithm
 validation) is unchanged and still passing — 36 `unittest` tests.
 
-## 27. Manual hash verification
+### Week 3 test coverage
+
+| Area | Representative tests |
+|---|---|
+| Monitoring loop | `test_w3_watch_alerts_added_modified_deleted`, `test_w3_scan_once_returns_snapshot_and_result`, `test_w3_watch_returns_ok_after_requested_scans` |
+| Changed files | `test_w3_watch_logs_every_change_and_scan`, `test_w3_watch_repeats_alerts_or_not` |
+| Ignore rules | `test_w3_ignore_rules_match_globs_and_folder_names`, `test_w3_ignored_files_never_enter_a_baseline`, `test_w3_ignored_files_never_trigger_alerts`, `test_w3_watch_reports_no_change_for_ignored_files`, `test_w3_ignore_rules_prune_ignored_directories_early`, `test_w3_shipped_filewatchignore_covers_required_patterns` |
+| Permission errors | `test_w3_permission_error_is_logged_and_monitoring_continues`, `test_w3_unreadable_file_is_not_reported_as_deleted`, `test_w3_unreadable_file_that_really_vanishes_is_deleted` |
+| Disappearing files | `test_w3_file_disappearing_between_walk_and_read`, `test_w3_oserror_in_walk_does_not_stop_the_scan` |
+| Clean shutdown | `test_w3_ctrl_c_exits_cleanly_without_traceback`, `test_w3_sigterm_is_translated_to_clean_exit` |
+| Logging hygiene | `test_w3_setup_logging_does_not_duplicate_handlers`, `test_w3_logger_does_not_propagate_to_root`, `test_w3_reset_logging_removes_managed_handlers`, `test_w3_log_has_timestamp_level_and_message` |
+| Alerts & colour | `test_w3_format_alerts_lists_relative_paths`, `test_w3_colour_autodetection_respects_no_color`, `test_w3_unreadable_files_are_shown_in_alerts` |
+| HMAC limitations (Week 4) | `test_w4_limitation_baseline_is_not_encrypted`, `test_w4_limitation_stolen_key_allows_forgery`, `test_w4_limitation_without_the_key_forgery_is_detected`, `test_w4_limitation_rollback_cannot_be_detected`, `test_w4_limitation_log_is_plaintext_and_unsigned` |
+| Backward compatibility | `test_w3_week1_and_week2_apis_keep_their_old_signatures`, `test_w3_cli_still_supports_every_previous_command`, `test_w3_cli_parses_watch_options`, `test_w3_demo_still_never_modifies_originals`, `test_w3_shipped_files_still_verify_against_shipped_baseline` |
+
+The five `test_w4_limitation_*` tests assert what HMAC does **not** do - the
+baseline stays plaintext, a stolen key permits forgery, a keyless attacker is
+still blocked, signed baselines can be replayed, and the log is unsigned. They
+are executable documentation: if someone later overstates the guarantee, these
+tests show the real boundary.
+
+**Determinism.** No test sleeps: the watch loop is called with `interval=0` and
+`max_scans=N`, which exits after N scans. Clean shutdown is tested by making the
+scan raise `KeyboardInterrupt` (exactly what the signal handler does), so the
+suite finishes in well under a second and is safe in CI.
+
+## 37. Manual hash verification
 
 Verify any digest yourself. If the values match, the file is byte-for-byte
 identical.
@@ -921,7 +1618,7 @@ sha256sum -c checksums.sha256          # prints "OK" / "FAILED" per file
 FileWatch's `baseline.json` is the JSON equivalent, with metadata and without
 needing shell tools.
 
-## 28. Troubleshooting
+## 38. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -937,15 +1634,35 @@ needing shell tools.
 | `No regular files found` | Folder empty or only subfolders/symlinks | Add a file or check `--folder` |
 | Windows symlink tests skipped | Creating symlinks needs admin/developer mode | Expected; the suite still passes |
 | `baseline.json` shows as modified in Git after `check` | Should not happen — `check` never writes | Confirm you ran `baseline`, not `check` |
+| `watch` re-alerts the same file | Change still differs from the reference | Default alerts once; use `--repeat-alerts` to change that deliberately |
+| Alerts have no colour | Output is piped, not a TTY, or `NO_COLOR` is set | Expected; disable-safe by design |
+| `filewatch.log` missing | `watch` was never run (only `watch` logs) | Run `python3 main.py watch --once` |
+| Log lines duplicated | A foreign handler was added by your own code | FileWatch only manages its own handlers; check yours |
+| `watch` exits immediately with code 1 | No baseline, or the folder is missing | Run `python3 main.py baseline` first |
+| Ignored file still alerts | Pattern does not match (matching is case-sensitive) | Test with `--verbose` and check the log's `Skipped entry` lines |
+| Huge folder, high CPU | Polling re-hashes everything each scan | Increase `--interval`, or add caches to `.filewatchignore` |
+| `No HMAC key configured` | Signing/verifying without a key | `python3 main.py keygen` then export the key |
+| `key is too short` | Fewer than 32 bytes | Use `keygen` (32 random bytes) |
+| `Key file ... too permissive` | Mode is not `0600` | `chmod 600 <file>` |
+| `signature MISMATCH` after re-baselining | New baseline data, old signature | Re-sign: `baseline --sign` |
+| Signature mismatch but you did not edit it | Wrong key, or the baseline really was changed | Investigate **before** re-signing |
 
-## 29. Roadmap and responsible use
+## 39. Roadmap and responsible use
 
-Possible next steps for a Week 3:
+Completed in Week 3: continuous watch mode with a configurable interval,
+structured logging, `.filewatchignore` rules, coloured alerts, robust error
+handling and clean shutdown.
+
+Completed in Week 4 (stretch): HMAC-SHA256 signed baselines with safe key
+management (`keygen`, `--sign`, `--verify`, `--require-signature`) — section 28.
+
+Possible next steps:
 
 * `--report json` so results can be consumed by other tools.
-* Watch mode (`--watch`) that polls the folder every N seconds.
 * Multiple baselines / snapshots over time, with history.
-* HMAC-signed baselines, so the baseline itself cannot be edited undetected.
+* Inotify/ReadDirectoryChangesW notifications instead of polling.
+* Key rotation with a key-id field, so old and new signatures can coexist.
+* Anti-rollback: anchor the baseline signature in an external trusted store.
 
 **Responsible use.** This is an educational tool for monitoring files on your own
 machine.
