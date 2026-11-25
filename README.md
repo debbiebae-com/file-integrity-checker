@@ -4,6 +4,7 @@
 **Week 2:** Baseline snapshots and change detection (added / modified / deleted / unchanged)
 **Week 3:** Continuous monitoring, structured logging, ignore rules and terminal alerts
 **Week 4 (stretch):** HMAC-SHA256 signed baselines — tamper-evident reference data
+**Week 4:** Integrity reports and dashboard — log parsing, Streamlit dashboard, Markdown/HTML reports
 
 A beginner-friendly, standard-library-only Python tool that shows how cryptographic
 hashing is used to detect changes to files. It hashes the files in a local
@@ -58,6 +59,17 @@ continuously**, logging and alerting on every change until you stop it.
 26. [Clean shutdown (Ctrl+C / SIGTERM)](#26-clean-shutdown-ctrlc--sigterm)
 27. [What changed in Week 3 (and why)](#27-what-changed-in-week-3-and-why)
 28. [HMAC baseline signing (stretch goal — implemented)](#28-hmac-baseline-signing-stretch-goal--implemented)
+
+**Week 4 — reports and dashboard**
+40. [Week 4 functionality](#40-week-4-functionality)
+41. [Installing the Week 4 dependencies](#41-installing-the-week-4-dependencies)
+42. [Parsing the monitoring log](#42-parsing-the-monitoring-log)
+43. [Running the dashboard](#43-running-the-dashboard)
+44. [Generating reports](#44-generating-reports)
+45. [Security limitations and mitigations](#45-security-limitations-and-mitigations)
+46. [Detection is not prevention](#46-detection-is-not-prevention)
+47. [Screenshots and demo instructions](#47-screenshots-and-demo-instructions)
+48. [Ethical use](#48-ethical-use)
 
 **Using and testing the project**
 29. [Technologies used](#29-technologies-used)
@@ -1127,6 +1139,426 @@ than implemented:
    attacker cannot write, and compare occasionally - this catches forgeries that
    would otherwise look legitimate.
 
+## 40. Week 4 functionality
+
+Week 4 adds a **reporting and visualisation layer** on top of the monitoring
+engine. Nothing from Weeks 1-3 changed: `main.py` is untouched by this work, and
+the new code lives in three new files.
+
+| File | Purpose | Dependencies |
+|---|---|---|
+| `logger_parser.py` | Parses `filewatch.log` into events; builds report data; renders Markdown and HTML | **stdlib only** |
+| `report.py` | CLI: `events` table and `report` generation | **stdlib only** |
+| `dashboard.py` | Streamlit dashboard: metrics, timeline, event table, refresh | Streamlit (+ pandas) |
+| `requirements.txt` | The optional dashboard/test dependencies | — |
+
+Because the parsing and reporting modules use only the standard library,
+`python3 report.py report --format both` works on a machine where **nothing**
+has been pip-installed. Only the dashboard needs Streamlit.
+
+Recognised log events:
+
+| Event | Log line written by `watch` |
+|---|---|
+| `ADDED` | `WARNING \| filewatch \| ADDED file: <path>` |
+| `MODIFIED` | `WARNING \| filewatch \| MODIFIED file: <path>` |
+| `DELETED` | `WARNING \| filewatch \| DELETED file: <path>` |
+| `UNREADABLE` | `ERROR \| filewatch \| Unreadable file (...): <path>` |
+| `ERROR` | any other `ERROR`/`CRITICAL` line |
+
+`INFO`/`DEBUG` lines ("Scan 1: no changes", "Watch started") are counted as
+monitoring activity but are **never** shown as change events.
+
+## 41. Installing the Week 4 dependencies
+
+The monitor, the parser and the report generator need **nothing** beyond Python
+3.9+. Only the dashboard (and the dashboard tests) need extra packages.
+
+```bash
+cd file-integrity-checker
+
+# Recommended: an isolated environment
+python3 -m venv .venv
+. .venv/bin/activate            # Linux / macOS
+# .venv\Scripts\activate         # Windows
+
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements.txt
+```
+
+`requirements.txt` contains exactly three packages:
+
+```
+streamlit>=1.30,<2.0      # dashboard
+plotly>=5.18,<7.0         # stacked timeline chart (optional, graceful fallback)
+pytest>=7.0               # test suite
+```
+
+If you install nothing, these still work:
+
+```bash
+python3 main.py                 # Weeks 1-3 unchanged
+python3 report.py events        # parsed event table
+python3 report.py report --format both
+```
+
+## 42. Parsing the monitoring log
+
+```bash
+python3 report.py events
+```
+
+```
+============================================================================================
+                               FILEWATCH - PARSED LOG EVENTS
+============================================================================================
+Log file   : filewatch.log
+Lines read : 8  (recognised 8, malformed 0)
+Summary    : 3 change event(s): 1 added, 1 modified, 1 deleted
+--------------------------------------------------------------------------------------------
+Event counts:
+  ADDED        1
+  MODIFIED     1
+  DELETED      1
+  UNREADABLE   0
+  ERROR        0
+--------------------------------------------------------------------------------------------
+Timestamp            Event     Level    File
+-------------------  --------  -------  -----------
+2026-11-25 17:22:57  ADDED     WARNING  added_a.txt
+2026-11-25 17:22:57  MODIFIED  WARNING  file2.txt
+2026-11-25 17:22:57  DELETED   WARNING  file7.txt
+--------------------------------------------------------------------------------------------
+Showing 3 event(s)
+```
+
+Options:
+
+| Option | Meaning |
+|---|---|
+| `--log PATH` | Parse a different log file (default `filewatch.log`) |
+| `--limit N` | Show only the N most recent events |
+
+From Python:
+
+```python
+import logger_parser as lp
+
+result = lp.parse_log_file("filewatch.log")
+print(lp.summarize(result))          # "3 change event(s): ..."
+for event in lp.recent_events(result, limit=5):
+    print(event.timestamp, event.event_type, event.path)
+print(lp.timeline(result, bucket="hour"))
+```
+
+**Robustness.** The parser tolerates a missing file, an empty file, a directory
+path, a permission error, binary bytes, impossible timestamps, traceback
+continuation lines and hand-edited spacing. Nothing raises: unreadable lines are
+counted in `malformed_lines` and the good lines are still returned. Malformed
+lines are surfaced deliberately, because a burst of them can mean a crash, two
+writers, or someone editing the log.
+
+## 43. Running the dashboard
+
+```bash
+python3 -m streamlit run dashboard.py
+```
+
+Then open <http://localhost:8501>. To use a different log:
+
+```bash
+FILEWATCH_LOG=/path/to/other.log python3 -m streamlit run dashboard.py
+# or type the filename in the sidebar "Log file (optional)" box
+```
+
+What it shows:
+
+| Area | Content |
+|---|---|
+| **Metrics** | Total changes, plus separate ADDED / MODIFIED / DELETED counts |
+| **Timeline** | Stacked bar chart of changes over time (minute / hour / day buckets) |
+| **Recent events** | Table of the latest events with timestamp, type, level and relative path |
+| **Filters** | Event-type filter and row-count slider |
+| **Refresh** | A **🔄 Refresh** button, plus an optional auto-refresh interval |
+| **Downloads** | CSV of the visible events; Markdown and HTML reports, generated in memory |
+| **Empty state** | An explicit message when the log is missing, empty, or has no events |
+
+Useful options for a headless machine:
+
+```bash
+python3 -m streamlit run dashboard.py \
+    --server.address 0.0.0.0 --server.port 8501 \
+    --server.headless true --browser.gatherUsageStats false
+```
+
+The dashboard is **read-only** with respect to your data: it never writes to the
+log, the baseline or the monitored folder, and it never reads or displays HMAC
+keys.
+
+## 44. Generating reports
+
+```bash
+# Markdown (default)
+python3 report.py report --format md
+
+# HTML
+python3 report.py report --format html
+
+# Both at once
+python3 report.py report --format both
+
+# Choose the output directory / add more recent changes
+python3 report.py report --format both --out reports --recent 50
+```
+
+Default output is `reports/integrity-report.md` and
+`reports/integrity-report.html`.
+
+Each report contains:
+
+* generation timestamp and the log file analysed,
+* event summary table (ADDED / MODIFIED / DELETED / UNREADABLE / ERROR + total),
+* log-health block (lines read, recognised, informational, malformed),
+* first and last event timestamps,
+* a table of recent changes with relative paths,
+* the most frequently changed files,
+* the limitations section and the legal/ethical notice.
+
+A report generated when the log is missing is still written - it states clearly
+that no log data was available and how to create some, which is more useful than
+an empty file. The CLI exits `1` in that case so scripts can detect it.
+
+From Python:
+
+```python
+import logger_parser as lp
+
+result = lp.parse_log_file("filewatch.log")
+data   = lp.build_report_data(result, recent_limit=25)
+print(lp.render_markdown(data))          # str
+print(lp.render_html(data))              # str
+lp.write_report(data, "reports/r.md")    # writes the file
+```
+
+HTML safety: every dynamic value (including file names) is escaped with
+`html.escape()` and inline CSS is used, so a file called
+`<script>alert(1)</script>.txt` appears as text. Reports contain **no secrets** -
+a test asserts that no HMAC key material can leak into a report.
+
+## 45. Security limitations and mitigations
+
+FileWatch is a learning project, and it is honest about what it cannot do. These
+are not theoretical: each one is demonstrated in the Week 4 test suite or the
+notes below.
+
+### Limitation 1 — an attacker can modify the baseline
+
+`baseline.json` is an ordinary file. Anyone who can write to the project folder
+can edit a stored hash (or delete an entry) so that a tampered file looks
+normal. The monitor then reports "no changes" while the change is real.
+
+**Mitigations**
+
+1. **Sign the baseline** and always verify it:
+   ```bash
+   export FILEWATCH_HMAC_KEY=<key from a secrets manager>
+   python3 main.py baseline --sign
+   python3 main.py check --require-signature
+   python3 main.py watch --require-signature
+   ```
+   Any edit to `baseline.json` now produces `signature MISMATCH` and the check
+   refuses to run.
+2. **Restrict permissions** on the project folder: `chmod 750`, owned by the
+   monitoring account, not writable by others.
+3. **Keep a copy off-box** (`rsync`, a git commit of `baseline.json`, object
+   storage) and compare occasionally. A locally forged baseline cannot match an
+   externally stored copy.
+4. **Watch the baseline itself** with a second baseline in a different folder,
+   or simply record its hash somewhere else you trust.
+
+**Residual risk:** with the HMAC key in hand the forgery is undetectable by
+FileWatch (see limitation 2). Mitigation 3 is the only one that survives that.
+
+### Limitation 2 — an attacker can compromise the HMAC key
+
+If the key leaks, the signature stops meaning anything: the attacker edits a
+file, rewrites the baseline and re-signs it. FileWatch reports
+`signature verified` and sees no changes. There is no cryptographic bug here -
+a symmetric MAC can only distinguish *has the key* from *does not have the key*.
+
+**Mitigations**
+
+1. **Never hardcode the key.** It comes from `$FILEWATCH_HMAC_KEY` or a `0600`
+   key file; a test asserts no 64-character hex literal exists in the source.
+2. **Keep it outside the repository and outside the monitored folder**, in a
+   secrets manager or OS keyring. `.gitignore` already excludes `*.key`.
+3. **Enforce file mode `0600`** - FileWatch refuses a group/world-readable key
+   file outright.
+4. **Rotate on any suspicion:** generate a new key and re-run
+   `baseline --sign`. Old signatures become invalid, which is the point.
+5. **Move to asymmetric signing (Ed25519)** for real deployments: `check` would
+   hold only a *public* key, so stealing the verifier's key no longer permits
+   forgery. Documented in section 28, not implemented (needs the
+   `cryptography` package and breaks the stdlib-only design).
+6. **Limit blast radius:** run the monitor as a dedicated low-privilege user
+   whose environment holds nothing else worth stealing.
+
+**Residual risk:** if the key is stolen *and* the attacker can write to the
+baseline, detection is impossible locally. External anchoring is required.
+
+### Limitation 3 — the local log can be tampered with (or lost)
+
+`filewatch.log` is a plain text file on the same disk as the thing it monitors.
+An attacker who can write to the folder can delete their own `ADDED` lines,
+forge `INFO` lines, truncate the file, or replace it with binary junk. It can
+also simply be lost to disk-full or log rotation. **The dashboard and the
+reports inherit whatever the log says** - they visualise evidence, they do not
+create it.
+
+**Mitigations**
+
+1. **Ship copies off-box in real time:** use `rsyslog`/`systemd-journal-upload`,
+   a `tail -F filewatch.log | logger` pipe, or an append-only remote bucket.
+2. **Make the log append-only locally:** `chattr +a filewatch.log` (Linux,
+   ext4/xfs) stops rewriting and truncation. Combine with file permissions.
+3. **Detect log tampering with FileWatch itself:** put `filewatch.log` inside a
+   *second* monitored folder, or add it to a baseline in another location, so
+   deletions and truncations become `MODIFIED`/`DELETED` events.
+4. **Watch `malformed_lines`.** A sudden burst of unparsable lines - shown in the
+   dashboard as an info banner and counted in every report - often means the log
+   was appended to, interleaved by a second process, or replaced.
+5. **Prefer WORM / append-only storage** for anything you may need as evidence.
+6. **Note the clock.** Timestamps come from the local machine; a host with a
+   wrong (or attacker-set) clock produces misleading timelines. Keep NTP
+   healthy, or timestamp at the log shipper instead.
+
+**Residual risk:** with only local storage, a determined attacker can always
+cover their tracks. Only off-host, append-only storage changes that.
+
+### Limitation 4 — scope: one folder, polling, no prevention
+
+FileWatch only looks at the folder you point it at (default `test_folder`),
+only by polling every `--interval` seconds, and it only ever **reads**. It does
+not use inotify, so a file created and deleted within one interval is missed
+entirely; and it does not block anything (see section 46).
+
+**Mitigations:** use a short interval on small folders, add the folders you care
+about explicitly, and pair FileWatch with prevention controls (file permissions,
+SELinux/AppArmor, immutable attributes, backups) rather than relying on
+detection alone.
+
+### Summary table
+
+| Risk | Detected by FileWatch alone? | Primary mitigation |
+|---|---|---|
+| Baseline edited | No (looks normal) | `baseline --sign` + `--require-signature` |
+| HMAC key stolen | **No** | Off-box copy of baseline; rotate; move to Ed25519 |
+| Log edited / truncated | Partly (`malformed_lines`, second monitor) | Ship logs off-box; `chattr +a`; second baseline |
+| Change missed between polls | No | Shorter `--interval`; add more folders |
+| Attack prevented | **Never** | File permissions, MAC, backups, patching |
+
+## 46. Detection is not prevention
+
+**FileWatch detects changes; it does not prevent attacks.**
+
+Every event in the log describes something that **already happened**. By the
+time `ADDED file: shell.php` appears in the dashboard, the file is on disk and
+whatever it does has already begun. FileWatch has no ability to:
+
+* block a write, delete or rename,
+* stop a process from running,
+* quarantine or restore a file,
+* prevent privilege escalation, ransomware encryption or data exfiltration.
+
+Concretely:
+
+* an attacker who adds a webshell and deletes nothing will appear as one `ADDED`
+  event - after the shell is already reachable;
+* ransomware that encrypts 10 000 files shows as 10 000 `MODIFIED` events *while*
+  they are being encrypted;
+* if the attacker also edits the baseline and holds the key, there may be **no
+  event at all**.
+
+That is why integrity monitoring is one layer of defence in depth, never the
+whole defence. It answers "did this change?" and "when?" - not "is this safe?"
+and never "stop that". Pair it with controls that actually enforce something:
+least-privilege file permissions, mandatory access control (SELinux/AppArmor),
+read-only or immutable mounts, tested offline backups, and timely patching.
+
+Its real value is **detection and evidence**: noticing an unexpected change
+quickly, and being able to say precisely what changed and when.
+
+## 47. Screenshots and demo instructions
+
+A five-minute demonstration that produces everything the dashboard and reports
+need. Run it in a **copy** of the project so the shipped samples stay pristine.
+
+```bash
+# 1. One-time setup (dashboard only; reports need nothing)
+python3 -m venv .venv && . .venv/bin/activate
+python3 -m pip install -r requirements.txt
+
+# 2. Baseline, then start the monitor in this terminal
+python3 main.py baseline
+python3 main.py watch --interval 3
+
+# 3. In a SECOND terminal, generate some events
+echo "new file"        > test_folder/demo_added.txt
+echo "tampered line"  >> test_folder/file1.txt
+rm                     test_folder/file5.txt
+echo "ignored"         > test_folder/scratch.tmp     # ignored by .filewatchignore
+
+# 4. Stop the monitor with Ctrl+C, then view the events
+python3 report.py events
+
+# 5. Generate the reports
+python3 report.py report --format both
+
+# 6. Start the dashboard and open http://localhost:8501
+python3 -m streamlit run dashboard.py
+```
+
+**Screenshots worth capturing** (each demonstrates a requirement):
+
+1. **`python3 report.py events`** - the parsed event table with counts
+   (requirement 1).
+2. **Dashboard overview** - the four metric cards (total / added / modified /
+   deleted) and the red "Deleted" tile (requirement 2).
+3. **Dashboard timeline** - the stacked bar chart after two or three rounds of
+   changes, with the bucket selector set to `minute`.
+4. **Dashboard with no log** - the empty-state message, proving graceful
+   handling of a missing log.
+5. **Reports in an editor** - `reports/integrity-report.md` open beside
+   `reports/integrity-report.html` in a browser (requirement 3).
+6. **Test run** - `python3 -m pytest -q` showing the full green summary.
+7. *(Optional)* `ls -l` on the project showing `filewatch.log` and the
+   `reports/` directory.
+
+**Before you publish any screenshot:** check that no HMAC key, `.env` content or
+absolute `/home/<you>/...` path is visible. FileWatch never prints keys - but
+your terminal scrollback might.
+
+## 48. Ethical use
+
+FileWatch is a **defensive, educational** tool for monitoring files on a machine
+you own or are explicitly authorised to monitor.
+
+> **LEGAL AND ETHICAL NOTICE:** Scanning or attacking systems you do not own or have written permission to test is illegal. This tool only monitors your own test folder.
+
+* Only point `--folder` at directories you own or have **written permission** to
+  monitor. On a work or school machine, get that permission before you start.
+* Do not use it to watch another person's files, to build a profile of their
+  activity, or to monitor a shared machine without disclosing it. Doing so may
+  breach computer-misuse law, privacy law (e.g. GDPR) and your organisation's
+  policy.
+* FileWatch is **not** a network scanner, port scanner, vulnerability scanner or
+  penetration-testing tool. It opens no sockets, sends no traffic and scans
+  nothing outside the folder you give it.
+* Do not extend it to inspect machines or data you do not own. "It only reads
+  files" is not a legal defence if the files are not yours.
+* If you find a real security incident, do not investigate it yourself -
+  report it through your organisation's incident process.
+
 ## 29. Technologies used
 
 * **Python 3.9+** (developed and tested on Python 3.13)
@@ -1144,6 +1576,10 @@ than implemented:
 * **`hmac`** — HMAC-SHA256 baseline signatures (Week 4)
 * **`secrets`** — cryptographically secure key generation (Week 4)
 * **`stat`** — enforcing `0600` on key files (Week 4)
+* **`dataclasses`** — typed `LogEvent` / `ParseResult` records (Week 4)
+* **`html`** — escaping dynamic values in HTML reports (Week 4)
+* **Streamlit** — dashboard UI (Week 4, optional dependency)
+* **Plotly / pandas** — timeline chart and event table (Week 4, optional)
 * **`unittest` + `unittest.mock`** — Week 1 test suite
 * **`pytest`** — Week 2/3 test suites (`tmp_path` fixture)
 
@@ -1187,6 +1623,11 @@ file-integrity-checker/
 ├── baseline.json           # Saved SHA-256 baseline (sample, committed)
 ├── .filewatchignore        # Week 3: ignore patterns for scan/check/watch
 ├── filewatch.log           # Week 3: created at runtime by `watch` (git-ignored)
+├── logger_parser.py        # Week 4: log parsing + Markdown/HTML report rendering (stdlib)
+├── report.py               # Week 4: reporting CLI (events table, reports) (stdlib)
+├── dashboard.py            # Week 4: Streamlit dashboard (metrics, timeline, refresh)
+├── requirements.txt        # Week 4: optional dashboard/test dependencies
+├── reports/                # Week 4: generated reports (git-ignored)
 ├── README.md               # This document
 ├── test_main.py            # Week 1 unittest + Week 2/3 pytest suites (103 tests)
 ├── .gitignore              # Keeps caches, logs, demo leftovers and secrets out of Git
@@ -1288,12 +1729,27 @@ file-integrity-checker/
    python3 main.py check                    # still "No changes detected"
    ```
 
-10. **Run the tests**
+10. **Parse the log and generate reports (Week 4)**
 
-   ```bash
-   python3 -m pytest -v          # Week 1-3 (recommended)
-   python3 -m unittest -v        # Week 1 (built in)
-   ```
+    ```bash
+    python3 report.py events                  # structured event table
+    python3 report.py report --format md      # -> reports/integrity-report.md
+    python3 report.py report --format html    # -> reports/integrity-report.html
+    ```
+
+11. **Open the dashboard (Week 4)**
+
+    ```bash
+    python3 -m pip install -r requirements.txt
+    python3 -m streamlit run dashboard.py     # http://localhost:8501
+    ```
+
+12. **Run the tests**
+
+    ```bash
+    python3 -m pytest -v          # Week 1-4 (recommended)
+    python3 -m unittest -v        # Week 1 (built in)
+    ```
 
 9. **Use another folder or baseline**
 
@@ -1340,8 +1796,19 @@ python3 main.py check --require-signature           # refuse unsigned baselines
 python3 main.py watch --require-signature           # monitor only a signed baseline
 python3 main.py check --key-file ~/.config/fw/hmac.key
 
+# --- Week 4: reports and dashboard ---
+python3 report.py events                          # parsed events as a table
+python3 report.py events --limit 10               # only the 10 most recent
+python3 report.py report --format md              # Markdown report
+python3 report.py report --format html            # HTML report
+python3 report.py report --format both            # both formats
+python3 report.py report --out reports --recent 50
+python3 report.py events --log /path/to/other.log
+python3 -m streamlit run dashboard.py             # dashboard on :8501
+
 # --- Help ---
 python3 main.py --help
+python3 report.py --help
 ```
 
 Windows equivalents use `python` instead of `python3`.
@@ -1482,6 +1949,10 @@ silently destroys your baseline.**
 | Unsigned baseline with `--require-signature` | Exit 1 |
 | Key file mode `0644` | Exit 1, "too permissive; run chmod 600" |
 | `keygen --out` inside the project | Exit 1, nothing written |
+| `report.py` with a missing log | Warning + a report that says "no data", exit 1 |
+| `filewatch.log` malformed | Bad lines counted and shown; good lines still parsed |
+| `filewatch.log` larger than 256 MiB | Only the most recent portion is read (reported) |
+| Dashboard with no log | Clear empty-state message with the commands to fix it |
 
 Notes:
 
@@ -1513,11 +1984,12 @@ python3 test_main.py
 Expected result:
 
 ```
-144 passed, 6 subtests passed
+191 passed, 6 subtests passed
 ```
 
-(63 Week 1/2 tests + 40 Week 3 tests + 36 Week 4 HMAC tests + 5 tests that
-encode the documented HMAC limitations.)
+(63 Week 1/2 + 40 Week 3 + 36 HMAC + 5 HMAC-limitation + 47 Week 4 reporting
+tests.) The four Streamlit UI tests are skipped automatically when Streamlit is
+not installed; the rest of the suite always runs.
 
 Coverage map — Week 2 specification:
 
@@ -1564,6 +2036,25 @@ baseline stays plaintext, a stolen key permits forgery, a keyless attacker is
 still blocked, signed baselines can be replayed, and the log is unsigned. They
 are executable documentation: if someone later overstates the guarantee, these
 tests show the real boundary.
+
+### Week 4 test coverage
+
+| Area | Representative tests |
+|---|---|
+| Log parsing | `test_w4_parse_single_line_extracts_all_fields`, `test_w4_parse_all_change_event_types`, `test_w4_parse_preserves_nested_and_unusual_paths`, `test_w4_parse_tolerates_extra_whitespace` |
+| Counts | `test_w4_parse_counts_and_line_accounting`, `test_w4_event_counts_are_correct`, `test_w4_parse_ignores_info_lines_as_events` |
+| Missing / empty / malformed logs | `test_w4_missing_log_is_handled`, `test_w4_empty_log_is_handled`, `test_w4_malformed_lines_are_counted_not_fatal`, `test_w4_unreadable_log_is_handled`, `test_w4_log_with_traceback_lines_is_partially_parsed` |
+| Timeline | `test_w4_timeline_buckets_by_minute`, `test_w4_timeline_hour_and_day_buckets`, `test_w4_timeline_rejects_unknown_bucket` |
+| Report generation | `test_w4_markdown_report_contains_required_sections`, `test_w4_html_report_is_valid_and_escapes_html`, `test_w4_write_report_markdown_and_html`, `test_w4_report_handles_missing_log` |
+| Secrets hygiene | `test_w4_reports_never_contain_secrets`, `test_w4_no_secrets_or_keys_in_repo_docs` |
+| Report CLI | `test_w4_report_cli_generates_both_formats`, `test_w4_report_cli_handles_missing_log`, `test_w4_events_cli_prints_a_table` |
+| Dashboard data layer | `test_w4_dashboard_data_from_log`, `test_w4_dashboard_data_missing_log`, `test_w4_dashboard_events_to_csv` |
+| Dashboard UI (Streamlit) | `test_w4_streamlit_dashboard_renders_events`, `test_w4_streamlit_dashboard_empty_state`, `test_w4_streamlit_dashboard_refresh_button_exists`, `test_w4_streamlit_dashboard_malformed_log` |
+| Documentation | `test_w4_readme_documents_limitations_and_ethics` |
+
+`test_w4_readme_documents_limitations_and_ethics` fails the build if the README
+stops documenting the three risks, "does not prevent", or the exact legal
+notice - so the documentation cannot silently rot.
 
 **Determinism.** No test sleeps: the watch loop is called with `interval=0` and
 `max_scans=N`, which exits after N scans. Clean shutdown is tested by making the
@@ -1646,6 +2137,11 @@ needing shell tools.
 | `Key file ... too permissive` | Mode is not `0600` | `chmod 600 <file>` |
 | `signature MISMATCH` after re-baselining | New baseline data, old signature | Re-sign: `baseline --sign` |
 | Signature mismatch but you did not edit it | Wrong key, or the baseline really was changed | Investigate **before** re-signing |
+| `ModuleNotFoundError: No module named 'streamlit'` | Dashboard deps not installed | `python3 -m pip install -r requirements.txt` |
+| Dashboard shows "Log file not found" | `watch` has never run | `python3 main.py watch --once`, then Refresh |
+| Dashboard shows zero events but the log is full | Log has only INFO lines, or the path is wrong | Check `python3 report.py events --log <path>` |
+| `report.py` prints "no events" | No changes have been detected yet | Change a file while `watch` is running |
+| Port 8501 already in use | Another Streamlit app is running | `--server.port 8502` |
 
 ## 39. Roadmap and responsible use
 
@@ -1663,6 +2159,9 @@ Possible next steps:
 * Inotify/ReadDirectoryChangesW notifications instead of polling.
 * Key rotation with a key-id field, so old and new signatures can coexist.
 * Anti-rollback: anchor the baseline signature in an external trusted store.
+* Ship logs to a remote append-only store (syslog/S3 Object Lock) to defeat the
+  log-tampering limitation in section 45.
+* Replace polling with inotify/ReadDirectoryChangesW for real-time detection.
 
 **Responsible use.** This is an educational tool for monitoring files on your own
 machine.

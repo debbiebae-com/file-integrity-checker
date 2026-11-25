@@ -1,0 +1,35 @@
+# FileWatch - optional dependencies
+# =================================
+#
+# IMPORTANT: the core tool (main.py) and the reporting CLI (report.py) use
+# ONLY the Python standard library. Nothing in this file is needed to run:
+#
+#     python3 main.py                     # Week 1 scan
+#     python3 main.py baseline            # Week 2
+#     python3 main.py check               # Week 2
+#     python3 main.py watch               # Week 3
+#     python3 main.py baseline --sign     # Week 4 HMAC (stretch)
+#     python3 report.py events            # Week 4 parsed event table
+#     python3 report.py report --format md # Week 4 Markdown report
+#
+# These packages are required only for the Streamlit dashboard and the tests
+# that drive it:
+#
+#     python3 -m pip install -r requirements.txt
+#     python3 -m streamlit run dashboard.py
+#
+# Install command (recommended: a virtual environment):
+#     python3 -m venv .venv && . .venv/bin/activate
+#     python3 -m pip install -r requirements.txt
+
+# --- Week 4 dashboard ---------------------------------------------------------
+# Streamlit ships pandas and altair as dependencies; plotly is used for the
+# stacked timeline chart when present (the dashboard falls back to a built-in
+# bar chart if it is missing).
+streamlit>=1.30,<2.0
+plotly>=5.18,<7.0
+
+# --- Testing ------------------------------------------------------------------
+# pytest runs the Week 2-4 test suite (Week 1 tests also run under unittest,
+# which is part of the standard library).
+pytest>=7.0

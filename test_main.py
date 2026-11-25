@@ -2454,5 +2454,634 @@ def test_w4_limitation_log_is_plaintext_and_unsigned(tmp_path, clean_logging):
     assert "hmac" not in log_text.lower()
 
 
+# ===========================================================================
+# WEEK 4 TESTS - log parsing, dashboard data, reports, security documentation
+# ===========================================================================
+#
+# New modules under test: logger_parser.py (pure stdlib), report.py (stdlib
+# CLI) and dashboard.py (Streamlit). The Streamlit UI tests are skipped
+# automatically when Streamlit is not installed, so the suite always runs.
+#
+# No earlier test was modified or removed to make these pass.
+
+from datetime import datetime
+
+import logger_parser as lp
+import report as rp
+
+# A representative slice of a real filewatch.log produced by `main.py watch`.
+SAMPLE_LOG = """\
+2026-11-25 17:22:55 | INFO     | filewatch | Watch started: folder=/p/test_folder algorithm=sha256 interval=1.0s files=12 patterns=26
+2026-11-25 17:22:55 | INFO     | filewatch | Scan 1: no changes (12 file(s))
+2026-11-25 17:22:57 | WARNING  | filewatch | ADDED file: added_a.txt
+2026-11-25 17:22:57 | WARNING  | filewatch | MODIFIED file: file2.txt
+2026-11-25 17:22:57 | WARNING  | filewatch | DELETED file: subfolder/file7.txt
+2026-11-25 17:22:58 | ERROR    | filewatch | Unreadable file (content unknown, not reported as deleted): locked.txt
+2026-11-25 17:22:59 | ERROR    | filewatch | No usable baseline - run `python main.py baseline` first.
+2026-11-25 17:22:59 | INFO     | filewatch | Watch ended: scans=3 exit_code=130
+"""
+
+
+def _write_log(tmp_path, text, name="filewatch.log"):
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+# ---------------------------------------------------------------------------
+# 1. Log parsing
+# ---------------------------------------------------------------------------
+
+def test_w4_parse_single_line_extracts_all_fields():
+    """Timestamp, severity, event type and path are all extracted."""
+    line = "2026-11-25 17:22:57 | WARNING  | filewatch | ADDED file: added_a.txt"
+
+    event, status = lp.parse_log_line(line)
+
+    assert status == "event"
+    assert event.timestamp == datetime(2026, 11, 25, 17, 22, 57)
+    assert event.level == "WARNING"
+    assert event.event_type == "ADDED"
+    assert event.path == "added_a.txt"
+
+
+def test_w4_parse_all_change_event_types():
+    """ADDED, MODIFIED, DELETED, UNREADABLE and generic ERROR are recognised."""
+    result = lp.parse_log_text(SAMPLE_LOG)
+
+    types = [event.event_type for event in result.events]
+    assert types == ["ADDED", "MODIFIED", "DELETED", "UNREADABLE", "ERROR"]
+
+    paths = [event.path for event in result.events]
+    assert paths[0] == "added_a.txt"
+    assert paths[2] == "subfolder/file7.txt"   # nested paths survive intact
+    assert paths[4] is None                     # generic error has no file
+
+
+def test_w4_parse_counts_and_line_accounting():
+    """Counts, info lines, malformed lines and totals add up correctly."""
+    result = lp.parse_log_text(SAMPLE_LOG)
+
+    assert result.counts["ADDED"] == 1
+    assert result.counts["MODIFIED"] == 1
+    assert result.counts["DELETED"] == 1
+    assert result.counts["UNREADABLE"] == 1
+    assert result.counts["ERROR"] == 1
+    assert result.change_count == 3
+    assert result.total_lines == 8
+    assert result.info_lines == 3               # 2 INFO + ... see below
+    assert result.malformed_lines == 0
+
+
+def test_w4_parse_ignores_info_lines_as_events():
+    """'Scan 1: no changes' must never be reported as a change event."""
+    result = lp.parse_log_text(SAMPLE_LOG)
+
+    assert all("no changes" not in event.message for event in result.events)
+    assert lp.summarize(result).startswith("3 change event(s)")
+
+
+def test_w4_parse_preserves_nested_and_unusual_paths():
+    """Relative paths with folders, spaces and unicode are parsed verbatim."""
+    log = (
+        "2026-11-25 10:00:00 | WARNING  | filewatch | ADDED file: a/b/c/deep file.txt\n"
+        "2026-11-25 10:00:01 | WARNING  | filewatch | MODIFIED file: données/é.txt\n"
+        "2026-11-25 10:00:02 | WARNING  | filewatch | DELETED file: [weird] name (1).tmp\n"
+    )
+
+    result = lp.parse_log_text(log)
+
+    assert [event.path for event in result.events] == [
+        "a/b/c/deep file.txt", "données/é.txt", "[weird] name (1).tmp",
+    ]
+
+
+def test_w4_parse_tolerates_extra_whitespace():
+    """Hand-edited spacing still parses (the logger pads levels with %-8s)."""
+    line = "2026-11-25 17:22:57|WARNING|filewatch|ADDED file: x.txt"
+
+    event, status = lp.parse_log_line(line)
+
+    assert status == "event"
+    assert event.event_type == "ADDED"
+    assert event.path == "x.txt"
+
+
+# ---------------------------------------------------------------------------
+# 2. Missing / empty / malformed logs
+# ---------------------------------------------------------------------------
+
+def test_w4_missing_log_is_handled(tmp_path):
+    """A missing log returns an empty result with an explanatory error."""
+    result = lp.parse_log_file(tmp_path / "nope.log")
+
+    assert result.has_error
+    assert "not found" in result.error.lower()
+    assert result.events == []
+    assert result.is_empty
+
+
+def test_w4_empty_log_is_handled(tmp_path):
+    """An empty log is not an error - it simply has no events."""
+    path = _write_log(tmp_path, "")
+
+    result = lp.parse_log_file(path)
+
+    assert not result.has_error
+    assert result.events == []
+    assert result.total_lines == 0
+    assert "No log events available" in lp.summarize(result)
+
+
+def test_w4_whitespace_only_log_is_handled(tmp_path):
+    path = _write_log(tmp_path, "\n\n   \n\t\n")
+    result = lp.parse_log_file(path)
+
+    assert not result.has_error
+    assert result.events == []
+    assert result.skipped_lines == 4
+
+
+def test_w4_malformed_lines_are_counted_not_fatal(tmp_path):
+    """Garbage, wrong dates and binary bytes are counted, never raised."""
+    path = tmp_path / "filewatch.log"
+    path.write_bytes(
+        b"this is not a log line\n"
+        b"2026-13-45 99:99:99 | WARNING | filewatch | ADDED file: impossible.txt\n"
+        b"2026-11-25 10:00:00 | WARNING | filewatch | ADDED file: good.txt\n"
+        b"\x00\x01\x02 binary junk\n"
+    )
+
+    result = lp.parse_log_file(path)
+
+    assert result.malformed_lines == 3
+    assert result.counts["ADDED"] == 1          # the one good line survived
+    assert result.events[0].path == "good.txt"
+    assert len(result.malformed_samples) <= 5
+
+
+def test_w4_directory_instead_of_log_is_handled(tmp_path):
+    """Pointing at a directory is reported, not crashed on."""
+    result = lp.parse_log_file(tmp_path)
+
+    assert result.has_error
+    assert "directory" in result.error.lower()
+
+
+def test_w4_unreadable_log_is_handled(tmp_path):
+    """PermissionError while opening the log is caught."""
+    path = _write_log(tmp_path, SAMPLE_LOG)
+
+    with mock.patch("builtins.open", side_effect=PermissionError(13, "denied")):
+        result = lp.parse_log_file(path)
+
+    assert result.has_error
+    assert "permission" in result.error.lower()
+
+
+def test_w4_log_with_traceback_lines_is_partially_parsed():
+    """`logger.exception` writes a traceback; the summary line still counts."""
+    log = (
+        "2026-11-25 10:00:00 | ERROR    | filewatch | Watch loop stopped by an OS error\n"
+        "Traceback (most recent call last):\n"
+        '  File "main.py", line 1, in <module>\n'
+        "OSError: [Errno 5] Input/output error\n"
+    )
+
+    result = lp.parse_log_text(log)
+
+    assert result.counts["ERROR"] == 1
+    assert result.malformed_lines == 3
+
+
+# ---------------------------------------------------------------------------
+# 3. Counts, timeline and dashboard data
+# ---------------------------------------------------------------------------
+
+def test_w4_event_counts_are_correct():
+    result = lp.parse_log_text(SAMPLE_LOG)
+
+    counts = lp.event_counts(result)
+
+    assert counts["ADDED"] == 1
+    assert counts["MODIFIED"] == 1
+    assert counts["DELETED"] == 1
+    assert set(counts) == set(lp.EVENT_ORDER)
+
+
+def test_w4_timeline_buckets_by_minute():
+    """Two events in the same minute share one bucket."""
+    log = (
+        "2026-11-25 10:00:01 | WARNING  | filewatch | ADDED file: a.txt\n"
+        "2026-11-25 10:00:59 | WARNING  | filewatch | MODIFIED file: b.txt\n"
+        "2026-11-25 10:02:00 | WARNING  | filewatch | DELETED file: c.txt\n"
+    )
+
+    rows = lp.timeline(lp.parse_log_text(log), bucket="minute")
+
+    assert [row["bucket"] for row in rows] == ["2026-11-25 10:00", "2026-11-25 10:02"]
+    assert rows[0]["ADDED"] == 1 and rows[0]["MODIFIED"] == 1
+    assert rows[1]["DELETED"] == 1
+
+
+def test_w4_timeline_hour_and_day_buckets():
+    log = (
+        "2026-11-25 10:00:01 | WARNING  | filewatch | ADDED file: a.txt\n"
+        "2026-11-25 10:30:00 | WARNING  | filewatch | ADDED file: b.txt\n"
+        "2026-11-26 09:00:00 | WARNING  | filewatch | ADDED file: c.txt\n"
+    )
+    result = lp.parse_log_text(log)
+
+    hourly = lp.timeline(result, bucket="hour")
+    daily = lp.timeline(result, bucket="day")
+
+    assert [row["bucket"] for row in hourly] == ["2026-11-25 10:00", "2026-11-26 09:00"]
+    assert hourly[0]["ADDED"] == 2
+    assert [row["bucket"] for row in daily] == ["2026-11-25", "2026-11-26"]
+
+
+def test_w4_timeline_rows_include_totals():
+    rows = lp.timeline_rows(lp.parse_log_text(SAMPLE_LOG))
+    assert rows and rows[0]["total"] == 3
+
+
+def test_w4_timeline_rejects_unknown_bucket():
+    with pytest.raises(ValueError):
+        lp.timeline(lp.parse_log_text(SAMPLE_LOG), bucket="fortnight")
+
+
+def test_w4_timeline_is_empty_without_events():
+    assert lp.timeline(lp.parse_log_text(SAMPLE_LOG[:0])) == []
+
+
+def test_w4_recent_events_are_newest_first():
+    events = lp.recent_events(lp.parse_log_text(SAMPLE_LOG), limit=2)
+
+    assert len(events) == 2
+    assert events[0].timestamp >= events[1].timestamp
+    assert events[0].event_type == "ERROR"     # 17:22:59 is the latest
+
+
+def test_w4_filter_events_by_type():
+    result = lp.parse_log_text(SAMPLE_LOG)
+
+    only_changes = lp.filter_events(result, ["ADDED", "DELETED"])
+
+    assert {event.event_type for event in only_changes} == {"ADDED", "DELETED"}
+
+
+def test_w4_events_as_rows_shape():
+    rows = lp.events_as_rows(lp.parse_log_text(SAMPLE_LOG))
+
+    assert set(rows[0]) == {"Timestamp", "Event", "Level", "File", "Details"}
+    assert rows[0]["Event"] == "ADDED"
+
+
+# ---------------------------------------------------------------------------
+# 4. Report generation
+# ---------------------------------------------------------------------------
+
+def test_w4_markdown_report_contains_required_sections(tmp_path):
+    """The Markdown report has a timestamp, counts and recent details."""
+    path = _write_log(tmp_path, SAMPLE_LOG)
+    result = lp.parse_log_file(path)
+
+    text = lp.render_markdown(lp.build_report_data(result, log_path=path))
+
+    assert "# FileWatch - File Integrity Report" in text
+    assert "**Generated:**" in text
+    assert "## Event summary" in text
+    assert "| ADDED | 1 |" in text
+    assert "## Recent changes" in text
+    assert "file2.txt" in text
+    assert "subfolder/file7.txt" in text
+    assert "LEGAL AND ETHICAL NOTICE" in text
+
+
+def test_w4_html_report_is_valid_and_escapes_html(tmp_path):
+    """The HTML report escapes hostile file names (no script injection)."""
+    evil_log = ("2026-11-25 10:00:00 | WARNING  | filewatch | "
+                "ADDED file: <script>alert('x')</script>.txt\n")
+    path = _write_log(tmp_path, evil_log)
+    result = lp.parse_log_file(path)
+
+    html_text = lp.render_html(lp.build_report_data(result, log_path=path))
+
+    assert html_text.startswith("<!DOCTYPE html>")
+    assert "<script>alert" not in html_text, "raw script tag must be escaped"
+    assert "&lt;script&gt;" in html_text
+    assert "LEGAL AND ETHICAL NOTICE" in html_text
+    assert "</html>" in html_text
+
+
+def test_w4_report_handles_missing_log(tmp_path):
+    """A missing log still produces a report that says so."""
+    missing = tmp_path / "nope.log"
+    result = lp.parse_log_file(missing)
+
+    markdown = lp.render_markdown(lp.build_report_data(result, log_path=missing))
+    html_text = lp.render_html(lp.build_report_data(result, log_path=missing))
+
+    assert "No log data available" in markdown
+    assert "not found" in markdown.lower()
+    assert "No log data available" in html_text
+
+
+def test_w4_report_handles_empty_log(tmp_path):
+    path = _write_log(tmp_path, "")
+    result = lp.parse_log_file(path)
+    text = lp.render_markdown(lp.build_report_data(result, log_path=path))
+
+    assert "No change events were found" in text
+    assert "| **Total changes** | **0** |" in text
+
+
+def test_w4_write_report_markdown_and_html(tmp_path):
+    path = _write_log(tmp_path, SAMPLE_LOG)
+    report_data = lp.build_report_data(lp.parse_log_file(path), log_path=path)
+
+    md_path = lp.write_report(report_data, tmp_path / "out" / "r.md")
+    html_path = lp.write_report(report_data, tmp_path / "out" / "r.html")
+
+    assert md_path.is_file() and md_path.stat().st_size > 0
+    assert html_path.is_file() and html_path.stat().st_size > 0
+    assert md_path.read_text(encoding="utf-8").startswith("# FileWatch")
+    assert "<!DOCTYPE html>" in html_path.read_text(encoding="utf-8")
+
+
+def test_w4_write_report_rejects_unknown_format(tmp_path):
+    report_data = lp.build_report_data(lp.parse_log_text(SAMPLE_LOG))
+    with pytest.raises(ValueError):
+        lp.write_report(report_data, tmp_path / "r.pdf")
+
+
+def test_w4_reports_never_contain_secrets(tmp_path, monkeypatch):
+    """No HMAC key material may leak into a report, even if it is in the env."""
+    secret = main.generate_hmac_key()
+    monkeypatch.setenv(main.HMAC_KEY_ENV, secret)
+    path = _write_log(tmp_path, SAMPLE_LOG)
+    result = lp.parse_log_file(path)
+
+    markdown = lp.render_markdown(lp.build_report_data(result, log_path=path))
+    html_text = lp.render_html(lp.build_report_data(result, log_path=path))
+
+    assert secret not in markdown
+    assert secret not in html_text
+    # ...and no key *value* pattern (64 hex chars) appears either.
+    assert re.search(r"\b[0-9a-f]{64}\b", markdown) is None
+
+
+def test_w4_report_cli_generates_both_formats(tmp_path, capsys):
+    """`report.py report --format both` writes both files."""
+    log_path = _write_log(tmp_path, SAMPLE_LOG)
+    out_dir = tmp_path / "reports"
+
+    exit_code = rp.main(["report", "--log", str(log_path),
+                         "--format", "both", "--out", str(out_dir)])
+    captured = capsys.readouterr()
+
+    assert exit_code == rp.EXIT_OK
+    assert (out_dir / "integrity-report.md").is_file()
+    assert (out_dir / "integrity-report.html").is_file()
+    assert "Written" in captured.out
+
+
+def test_w4_report_cli_handles_missing_log(tmp_path, capsys):
+    """A missing log yields a warning, a report, and exit code 1."""
+    exit_code = rp.main(["report", "--log", str(tmp_path / "nope.log"),
+                         "--format", "md", "--out", str(tmp_path / "out")])
+    captured = capsys.readouterr()
+
+    assert exit_code == rp.EXIT_FAILURE
+    assert "Log file not found" in captured.err
+    assert (tmp_path / "out" / "integrity-report.md").is_file()
+
+
+def test_w4_events_cli_prints_a_table(tmp_path, capsys):
+    log_path = _write_log(tmp_path, SAMPLE_LOG)
+
+    exit_code = rp.main(["events", "--log", str(log_path)])
+    out = capsys.readouterr().out
+
+    assert exit_code == rp.EXIT_OK
+    assert "Timestamp" in out and "Event" in out and "File" in out
+    assert "added_a.txt" in out
+    assert "ADDED        1" in out
+
+
+def test_w4_events_cli_handles_missing_log(tmp_path, capsys):
+    exit_code = rp.main(["events", "--log", str(tmp_path / "nope.log")])
+    captured = capsys.readouterr()
+
+    assert exit_code == rp.EXIT_FAILURE
+    assert "Log file not found" in captured.err
+
+
+def test_w4_events_cli_limit(tmp_path, capsys):
+    log_path = _write_log(tmp_path, SAMPLE_LOG)
+
+    rp.main(["events", "--log", str(log_path), "--limit", "2"])
+    out = capsys.readouterr().out
+
+    assert "Showing 2 event(s) (most recent 2)" in out
+
+
+def test_w4_render_table_aligns_and_truncates():
+    table = rp.render_table(["A", "B"], [["1", "x" * 100]], max_widths=[5, 10])
+    lines = table.splitlines()
+
+    assert len(lines) == 3                      # header, separator, one row
+    assert all(len(line) <= 20 for line in lines)
+    assert "…" in lines[2]
+
+
+# ---------------------------------------------------------------------------
+# 5. Dashboard data layer (no Streamlit needed)
+# ---------------------------------------------------------------------------
+
+def test_w4_dashboard_data_from_log(tmp_path, monkeypatch):
+    import dashboard
+
+    log_path = _write_log(tmp_path, SAMPLE_LOG)
+    monkeypatch.setenv("FILEWATCH_LOG", str(log_path))
+
+    data = dashboard.load_dashboard_data()
+
+    assert data["has_events"] is True
+    assert data["counts"]["ADDED"] == 1
+    assert data["counts"]["MODIFIED"] == 1
+    assert data["counts"]["DELETED"] == 1
+    assert len(data["timeline_rows"]) == 1
+    assert data["timeline_rows"][0]["total"] == 3
+    assert "3 change event(s)" in data["summary"]
+
+
+def test_w4_dashboard_data_missing_log(tmp_path, monkeypatch):
+    import dashboard
+
+    monkeypatch.setenv("FILEWATCH_LOG", str(tmp_path / "nope.log"))
+
+    data = dashboard.load_dashboard_data()
+
+    assert data["has_events"] is False
+    assert data["error"] and "not found" in data["error"].lower()
+    message = dashboard.empty_state_message(data["path"], data["parse_result"])
+    assert "not found" in message.lower()
+    assert "python3 main.py watch" in message
+
+
+def test_w4_dashboard_empty_state_for_empty_log(tmp_path):
+    import dashboard
+
+    log_path = _write_log(tmp_path, "")
+    data = dashboard.load_dashboard_data(str(log_path))
+
+    message = dashboard.empty_state_message(data["path"], data["parse_result"])
+    assert "No log events available" in message
+
+
+def test_w4_dashboard_events_to_csv():
+    import dashboard
+
+    rows = lp.events_as_rows(lp.parse_log_text(SAMPLE_LOG), limit=2)
+    csv_text = dashboard.events_to_csv(rows)
+    lines = csv_text.strip().splitlines()
+
+    assert lines[0] == "Timestamp,Event,Level,File,Details"
+    assert len(lines) == 3
+    assert all(line.startswith('"') for line in lines[1:])
+
+
+def test_w4_dashboard_events_to_csv_empty():
+    import dashboard
+    assert dashboard.events_to_csv([]) == ""
+
+
+def test_w4_dashboard_resolve_log_path(tmp_path, monkeypatch):
+    import dashboard
+
+    monkeypatch.delenv("FILEWATCH_LOG", raising=False)
+    assert dashboard.resolve_log_path().name == "filewatch.log"
+
+    monkeypatch.setenv("FILEWATCH_LOG", str(tmp_path / "custom.log"))
+    assert dashboard.resolve_log_path() == tmp_path / "custom.log"
+
+    assert dashboard.resolve_log_path(str(tmp_path / "x.log")) == tmp_path / "x.log"
+
+
+# ---------------------------------------------------------------------------
+# 6. Streamlit UI smoke tests (skipped when Streamlit is absent)
+# ---------------------------------------------------------------------------
+
+streamlit = pytest.importorskip.__self__ if False else None  # placeholder
+
+
+def _app_test(log_path, monkeypatch):
+    """Build a Streamlit AppTest for dashboard.py against a given log."""
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.setenv("FILEWATCH_LOG", str(log_path))
+    return AppTest.from_file("dashboard.py", default_timeout=60).run()
+
+
+@pytest.mark.skipif(
+    __import__("importlib").util.find_spec("streamlit") is None,
+    reason="Streamlit is not installed (pip install -r requirements.txt)",
+)
+def test_w4_streamlit_dashboard_renders_events(tmp_path, monkeypatch):
+    """The dashboard renders metrics, a table and a timeline without errors."""
+    log_path = _write_log(tmp_path, SAMPLE_LOG)
+
+    app = _app_test(log_path, monkeypatch)
+
+    assert not app.exception
+    metrics = {m.label: m.value for m in app.metric}
+    assert metrics["Total changes"] == "3"
+    assert metrics["➕ Added"] == "1"
+    assert metrics["✏️ Modified"] == "1"
+    assert metrics["➖ Deleted"] == "1"
+    assert len(app.dataframe) == 1
+    assert any("Timeline of changes" in s.value for s in app.subheader)
+
+
+@pytest.mark.skipif(
+    __import__("importlib").util.find_spec("streamlit") is None,
+    reason="Streamlit is not installed (pip install -r requirements.txt)",
+)
+def test_w4_streamlit_dashboard_empty_state(tmp_path, monkeypatch):
+    """With no log the dashboard shows a clear message, not a crash."""
+    log_path = tmp_path / "nope.log"
+
+    app = _app_test(log_path, monkeypatch)
+
+    assert not app.exception
+    warnings = " ".join(w.value for w in app.warning)
+    assert "not found" in warnings.lower()
+    assert {m.label: m.value for m in app.metric}["Total changes"] == "0"
+
+
+@pytest.mark.skipif(
+    __import__("importlib").util.find_spec("streamlit") is None,
+    reason="Streamlit is not installed (pip install -r requirements.txt)",
+)
+def test_w4_streamlit_dashboard_refresh_button_exists(tmp_path, monkeypatch):
+    """The required refresh control is present and labelled."""
+    app = _app_test(_write_log(tmp_path, SAMPLE_LOG), monkeypatch)
+    assert any("Refresh" in b.label for b in app.button)
+
+
+@pytest.mark.skipif(
+    __import__("importlib").util.find_spec("streamlit") is None,
+    reason="Streamlit is not installed (pip install -r requirements.txt)",
+)
+def test_w4_streamlit_dashboard_malformed_log(tmp_path, monkeypatch):
+    """Malformed lines surface as an informational note, not an exception."""
+    path = tmp_path / "filewatch.log"
+    path.write_text("garbage line\nmore garbage\n", encoding="utf-8")
+
+    app = _app_test(path, monkeypatch)
+
+    assert not app.exception
+    assert any("could not be parsed" in i.value for i in app.info)
+
+
+# ---------------------------------------------------------------------------
+# 7. Week 4 documentation requirements
+# ---------------------------------------------------------------------------
+
+def test_w4_readme_documents_limitations_and_ethics():
+    """README must document >=3 limitations, detection-not-prevention and ethics."""
+    readme = (Path(__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+
+    lowered = readme.lower()
+    # The three named risks from the brief.
+    assert "baseline" in lowered and "rewrit" in lowered
+    assert "hmac key" in lowered or "hmac-key" in lowered
+    assert "log" in lowered and "tamper" in lowered
+    # Detection, not prevention.
+    assert "does not prevent" in lowered
+    # Ethical use and the exact legal sentence.
+    assert "Scanning or attacking systems you do not own or have written " \
+           "permission to test is illegal. This tool only monitors your own " \
+           "test folder." in readme
+    # Dashboard + report instructions.
+    assert "streamlit run dashboard.py" in readme
+    assert "report.py" in readme
+
+
+def test_w4_no_secrets_or_keys_in_repo_docs():
+    """No 32+ byte hex literal (key material) appears in docs or reports."""
+    root = Path(__file__).resolve().parent
+    pattern = re.compile(r"\b[0-9a-fA-F]{64}\b")
+
+    for name in ("README.md", "requirements.txt", ".filewatchignore"):
+        text = (root / name).read_text(encoding="utf-8")
+        # The signature example in the README is a hash of public data, but a
+        # *key* would be indistinguishable; ensure none is presented as a key.
+        for match in pattern.findall(text):
+            assert "FILEWATCH_HMAC_KEY=" not in text.split(match)[0][-40:], \
+                f"possible key literal in {name}"
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
