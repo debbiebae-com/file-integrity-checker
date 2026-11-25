@@ -2171,3 +2171,297 @@ machine.
 It reads only the folder you point at, follows no symbolic links, opens no network
 connections, and collects no data about other systems. Do not modify it to inspect
 machines or data you do not own or have explicit written authorisation to test.
+
+---
+
+## 49. Enhanced edition: structured events and a SQLite store
+
+This is the **enhanced Week 4 edition** (`filewatch-week4-enhanced.zip`). It keeps
+every Week 1-4 command, file format and test exactly as it was and adds two things
+on top:
+
+1. **`events.jsonl`** - a machine-readable, append-only event log written
+   alongside (never instead of) `filewatch.log`.
+2. **`filewatch.db`** - a SQLite database that stores the same events so they
+   can be filtered, charted and reported on efficiently.
+
+Neither is mandatory. If you delete `events.jsonl` and `filewatch.db`, the tool
+behaves exactly as it did in Week 4: `baseline`, `check`, `watch`, `keygen`,
+`report.py` and `dashboard.py` all still work from `filewatch.log` alone.
+
+### How the pieces fit together
+
+```
+                    +---------------------+
+ monitored folder -> | scan + SHA-256 hash | -> changes detected
+                    +---------------------+
+                              |
+              +---------------+----------------+
+              |                                |
+       filewatch.log                    events.jsonl
+   (human-readable, Week 3)        (one JSON object per line)
+              |                                |
+       logger_parser.py                  import-events
+              |                                |
+     report.py / dashboard.py          filewatch.db (SQLite)
+              |                                |
+              +------------> report.py / dashboard.py <----------+
+                                 (--source log | --source db)
+```
+
+* `watch` writes **both** files at the same moment, from the same detection.
+* `filewatch.log` is unchanged: same format string, same parser, same reports.
+* Importing is **idempotent** - run it as often as you like.
+
+## 50. `events.jsonl` format
+
+UTF-8, one compact JSON object per line, append-only, timestamps in **UTC**.
+Field order is fixed so diffs and `tail -f` stay readable:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `timestamp` | string | ISO 8601 UTC, `YYYY-MM-DDTHH:MM:SSZ` |
+| `event_type` | string | `ADDED`, `MODIFIED` or `DELETED` |
+| `path` | string | path relative to the monitored folder, POSIX separators |
+| `algorithm` | string or null | `sha256` / `sha1`, null when unknown |
+| `old_hash` | string or null | previous digest (null for `ADDED`) |
+| `new_hash` | string or null | current digest (null for `DELETED`) |
+| `source` | string | `watch` (from the monitor) or `import` |
+
+Real lines from a test run (hashes truncated here for width only - the file
+contains full 64-character digests):
+
+```json
+{"timestamp":"2026-11-25T18:50:11Z","event_type":"ADDED","path":"d.txt","algorithm":"sha256","old_hash":null,"new_hash":"0f15384d18...","source":"watch"}
+{"timestamp":"2026-11-25T18:50:11Z","event_type":"MODIFIED","path":"a.txt","algorithm":"sha256","old_hash":"b6a98d9ce9...","new_hash":"f05f6f5ba8...","source":"watch"}
+{"timestamp":"2026-11-25T18:50:11Z","event_type":"DELETED","path":"b.txt","algorithm":"sha256","old_hash":"f2c82decdd...","new_hash":null,"source":"watch"}
+```
+
+Nothing is written when a scan finds no changes.
+
+**Robustness rules**
+
+* A malformed line, a missing field or an unparsable timestamp is **skipped and
+  reported**, never silently dropped and never fatal - see `read_events()`.
+* A file that cannot be read is logged as `UNREADABLE` in `filewatch.log` but is
+  **not** written to `events.jsonl`. An unknown file has no trustworthy hash, so
+  the tool refuses to guess.
+* No secrets are ever written: the HMAC key is never touched by this module.
+* If `events.jsonl` cannot be written (read-only folder, full disk), a warning is
+  logged and monitoring continues on `filewatch.log` as before.
+
+## 51. SQLite database: schema and setup
+
+Created automatically on first import; nothing to install (SQLite ships with
+Python).
+
+```sql
+CREATE TABLE events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id    TEXT NOT NULL UNIQUE,   -- de-duplication key
+    timestamp   TEXT NOT NULL,          -- ISO 8601 UTC, sortable as text
+    event_type  TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    algorithm   TEXT,
+    old_hash    TEXT,
+    new_hash    TEXT,
+    source      TEXT NOT NULL,
+    imported_at TEXT NOT NULL           -- when this row entered the DB
+);
+CREATE INDEX idx_events_timestamp ON events(timestamp);
+CREATE INDEX idx_events_type      ON events(event_type);
+CREATE INDEX idx_events_path      ON events(path);
+```
+
+* **Parameterised SQL only** - every user value is a bound parameter. There is no
+  string-built SQL anywhere in `database.py`.
+* **Transactions** - a whole import is one transaction; it either lands or rolls
+  back, so a crash cannot leave half a batch behind.
+* **Never destructive** - no `DELETE`, no `DROP`, no "reset on startup". Your
+  history is never thrown away by the tool.
+* `PRAGMA journal_mode=WAL` and `PRAGMA user_version=1` are set on connect.
+
+**Uniqueness strategy (why re-importing cannot duplicate rows).** Each row gets
+
+```
+event_id = sha256(timestamp ␟ event_type ␟ path ␟ algorithm ␟ old_hash ␟ new_hash)
+```
+
+The column is `UNIQUE` and rows are inserted with `INSERT OR IGNORE`, so the
+database treats an event as "the same event" if and only if all its identifying
+content matches. Import the same file ten times: rows 2-10 change nothing.
+`import-events` reports the split as `Imported` / `Duplicates`.
+
+**Timezone handling.** Everything is stored in UTC, so comparing the ISO strings
+gives chronological order. A bare `--start 2026-11-01` means
+`2026-11-01T00:00:00Z` and a bare `--end 2026-11-30` means
+`2026-11-30T23:59:59Z` - **both ends are inclusive of the whole day**. An
+explicit offset such as `2026-11-25T12:00:00+02:00` is converted to UTC
+(`10:00:00Z`) before comparing.
+
+## 52. Monitor -> database workflow
+
+```bash
+# 1. start the monitor (writes filewatch.log AND events.jsonl)
+python3 main.py baseline
+python3 main.py watch --interval 5
+
+# 2. load the events into SQLite (safe to repeat)
+python3 main.py import-events
+```
+
+`import-events` prints what it did:
+
+```
+Events file: events.jsonl
+Database   : filewatch.db
+Imported   : 3 new event(s)
+Duplicates : 0 already present (skipped)
+Total in DB: 3 event(s)
+Range      : 2026-11-25T18:50:11Z .. 2026-11-25T18:50:11Z
+```
+
+**Retry and recovery.** Import is pure "read the file, insert what is missing",
+which makes failure easy to recover from:
+
+| Situation | What to do |
+| --- | --- |
+| Import crashed halfway | Run `import-events` again. Loaded rows are skipped as duplicates. |
+| Database deleted or corrupted | Point `--db` at a new file and re-import the whole JSONL. JSONL is the source of truth. |
+| Events missed while the DB was down | They are still in `events.jsonl`; the next import picks them up. |
+| A line was hand-edited into nonsense | It is counted as malformed and listed; fix or delete that line, re-import. |
+
+SQLite is **never** required for Weeks 1-3 behaviour - the monitor does not
+depend on it and will not fail if it is absent or locked.
+
+## 53. Querying events
+
+```bash
+python3 main.py query-events                                  # newest 20
+python3 main.py query-events --limit 100                      # more rows
+python3 main.py query-events --type MODIFIED                  # one type
+python3 main.py query-events --start 2026-11-01 --end 2026-11-30
+python3 main.py query-events --path documents/                # contains
+python3 main.py query-events --start 2026-11-01 --end 2026-11-30 \
+                             --type DELETED --path documents/ # combined
+python3 main.py query-events --db /path/to/other.db           # other database
+```
+
+Every filter combines with AND. `--path` is a substring match and is escaped, so
+a literal `%` or `_` in a filename is matched literally rather than acting as a
+wildcard. An unparsable date gives a clear error and exit code 1.
+
+## 54. Reports from SQLite
+
+`report.py` gains `--source db` (default stays `log`, so Week 4 behaviour is
+byte-for-byte unchanged):
+
+```bash
+python3 report.py report --source db --format md
+python3 report.py report --source db --format both --out reports
+python3 report.py report --source db --start 2026-11-01 --end 2026-11-30
+python3 report.py report --source db --type MODIFIED --format html
+python3 report.py events --source db --limit 50
+```
+
+DB reports are written as `reports/integrity-report-db.md` and
+`.html`, carry a **Data source: SQLite database** line plus the active filters,
+and are rendered by the same escaping-aware functions used in Week 4 (HTML
+special characters in paths are escaped). An empty or missing database still
+produces a report that states the problem - never a crash.
+
+## 55. Dashboard with date and type filters
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m streamlit run dashboard.py
+```
+
+In the sidebar choose **Data source -> SQLite database** to get:
+
+* total matching changes and ADDED / MODIFIED / DELETED counts,
+* an inclusive **start date** / **end date** filter (`YYYY-MM-DD`),
+* an **event type** filter (leave all selected for every type),
+* an optional "path contains" filter and an hour/day timeline bucket,
+* the most recent events table with CSV download, plus Markdown/HTML report
+  downloads built from exactly what is on screen,
+* a **Refresh** button and an auto-refresh toggle.
+
+The dashboard reads the database in bounded queries (`MAX_ROWS = 5000`) and
+counts, timeline bucketing and filtering all happen inside SQLite, so it never
+pulls the whole table into memory. A missing database, an empty database, a
+corrupt file, a locked file or a bad date each produce a clear on-screen message
+instead of a traceback. Switch back to **Text log** at any time for the Week 4
+view.
+
+Useful environment variables: `FILEWATCH_LOG` (log path) and `FILEWATCH_DB`
+(database path), both overridable by the text boxes in the sidebar.
+
+## 56. Repository layout (enhanced edition)
+
+```
+main.py            engine, watch loop, CLI (incl. import-events / query-events)
+event_logger.py    NEW - events.jsonl writer/reader and schema validation
+database.py        NEW - SQLite schema, import, filtering, aggregation
+logger_parser.py   filewatch.log parser + Markdown/HTML renderers (now also
+                   renders DB rows via result_from_events())
+report.py          report CLI (--source log|db)
+dashboard.py       Streamlit dashboard (log or SQLite source)
+test_main.py       Weeks 1-4 suite (unchanged)
+test_enhanced.py      NEW - enhanced-edition suite (62 tests)
+requirements.txt   streamlit, plotly, pytest (all optional except for the dashboard)
+```
+
+## 57. Testing the enhanced edition
+
+```bash
+python3 -m pytest -q                 # everything: 253 passed
+python3 -m pytest test_enhanced.py -q   # enhanced suite only: 62 passed
+python3 -m unittest test_enhanced -v    # same 62 tests, stdlib runner
+python3 -m unittest test_main -v     # 36 TestCase classes from Weeks 1-4
+```
+
+Coverage includes: database creation and schema, insertion, persistence across
+connections, duplicate prevention, inclusive date filtering, type filtering,
+combined filters, empty database, corrupt database, malformed JSONL, missing
+fields, invalid timestamps, DB-sourced Markdown/HTML reports, empty-data
+reports, dashboard date/type filtering, and guards that Week 1-4 commands and
+the sample folder are untouched. Every test uses a temporary directory - the
+real `baseline.json`, `filewatch.log`, `events.jsonl` and `filewatch.db` are
+never touched.
+
+## 58. Limitations of the enhanced edition
+
+The five core limitations from section 45 still apply unchanged. The enhanced
+edition adds storage, so the honest position on the new files is:
+
+1. **`events.jsonl` and `filewatch.db` are ordinary local files.** Neither is
+   tamper-proof. Anyone who can write to the project directory - especially
+   root, or malware running as your user - can edit, truncate or delete them,
+   and the tool cannot tell. *Mitigation:* treat them as convenience stores for
+   analysis, not as evidence; ship events to a remote append-only store
+   (syslog, S3 Object Lock) if you need an audit trail you can defend, and keep
+   filesystem permissions tight (`chmod 600`, directory `700`).
+2. **A privileged attacker can also edit rows directly in SQLite.** The
+   `event_id` uniqueness column prevents accidental duplicates, not deliberate
+   forgery. *Mitigation:* the same remote-logging answer, plus cross-checking the
+   database against `filewatch.log` (both are written from the same detection,
+   so a mismatch is itself a signal).
+3. **Import is one-way and lossy about what it could not read.** Malformed lines
+   are reported and skipped. If you lose `events.jsonl` before importing, the
+   history exists only in `filewatch.log` in human-readable form. *Mitigation:*
+   import on a schedule (cron), keep a `.jsonl` copy outside the project.
+4. **Polling still may miss a create-and-delete between two scans,** so no event
+   is recorded at all - a database cannot fix that. *Mitigation:* shorter
+   `--interval`, and inotify-based monitoring as future work.
+5. **Timestamps come from the local clock.** A wrong clock puts events in the
+   wrong date bucket. *Mitigation:* keep NTP enabled; UTC storage at least
+   removes DST/year-boundary ambiguity.
+6. **Date filters are whole-day and UTC-based.** `--start 2026-11-25` means
+   00:00Z-23:59Z, which is not midnight-to-midnight in Accra or Lagos
+   (UTC+0 is forgiving, UTC+2 is not). *Mitigation:* pass full ISO timestamps
+   with an offset when you need exact boundaries.
+7. **Detection is still not prevention.** FileWatch detects and reports changes
+   to files you own; it does not block, quarantine or reverse them.
+
+> **LEGAL AND ETHICAL NOTICE:** Scanning or attacking systems you do not own or have written permission to test is illegal. This tool only monitors your own test folder.

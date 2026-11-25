@@ -95,3 +95,13 @@ desktop.ini
 *.key
 credentials.json
 secrets.json
+
+# --- Week 5: structured events and the SQLite database ---
+# Both are runtime output and are recreated from the monitor; never commit them.
+events.jsonl
+*.jsonl
+filewatch.db
+filewatch.db-*
+*.db-journal
+*.db-wal
+*.db-shm

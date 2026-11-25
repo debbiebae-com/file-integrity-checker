@@ -56,7 +56,7 @@ from __future__ import annotations
 import html
 import re
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -470,6 +470,93 @@ _EDUCATIONAL_NOTE = (
 )
 
 
+# ---------------------------------------------------------------------------
+# WEEK 4 ENHANCED: SQLite-backed report data
+# ---------------------------------------------------------------------------
+
+def result_from_events(events, source: Optional[str] = None,
+                       error: Optional[str] = None) -> ParseResult:
+    """Build a :class:`ParseResult` from already-structured event dictionaries.
+
+    Lets the Week 4 renderers (``render_markdown`` / ``render_html``) produce
+    reports from SQLite without duplicating either renderer. Event dictionaries
+    are the ones ``database.query_events`` returns: ``timestamp`` ISO-8601 UTC,
+    ``event_type``, ``path``, optionally ``old_hash``/``new_hash``/``source``.
+
+    A single bad record never aborts the report - it is counted as malformed so
+    the document can say so honestly instead of failing to render.
+    """
+    result = ParseResult(source=source, error=error)
+    for index, record in enumerate(events, start=1):
+        result.total_lines += 1
+        if not isinstance(record, dict):
+            result.malformed_lines += 1
+            continue
+
+        event_type = str(record.get("event_type") or "").upper()
+        if event_type not in EVENT_TYPES:
+            result.malformed_lines += 1
+            if len(result.malformed_samples) < 5:
+                result.malformed_samples.append(f"row {index}: unknown event type")
+            continue
+
+        moment = event_logger_timestamp(record.get("timestamp"))
+        if moment is None:
+            result.malformed_lines += 1
+            if len(result.malformed_samples) < 5:
+                result.malformed_samples.append(f"row {index}: bad timestamp")
+            continue
+
+        path = record.get("path")
+        message = f"{event_type} file: {path}" if path else event_type
+        if event_type in EVENT_LEVELS:
+            level = event_type
+        elif event_type == "UNREADABLE" or event_type == "ERROR":
+            level = "WARNING"
+        else:
+            level = "WARNING"
+
+        result.events.append(LogEvent(
+            timestamp=moment,
+            level=level,
+            event_type=event_type,
+            path=str(path) if path else None,
+            message=message,
+            line_number=index,
+        ))
+        result.parsed_lines += 1
+        result.counts[event_type] = result.counts.get(event_type, 0) + 1
+
+    # Newest first keeps the "recent events" table consistent with the log view.
+    result.events.sort(key=lambda event: event.timestamp)
+    return result
+
+
+def event_logger_timestamp(value) -> Optional[datetime]:
+    """Parse an ISO-8601 UTC timestamp into a naive datetime for the renderers.
+
+    The renderers were built for ``filewatch.log``'s naive timestamps, so the
+    UTC marker is dropped after conversion. ``None`` means "unparsable".
+    """
+    if isinstance(value, datetime):
+        moment = value
+    elif value is None:
+        return None
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            moment = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+    return moment
+
+
 def render_markdown(report: Dict[str, object]) -> str:
     """Render a report dictionary as a Markdown document."""
     counts = report["counts"]
@@ -478,20 +565,26 @@ def render_markdown(report: Dict[str, object]) -> str:
     lines.append("# FileWatch - File Integrity Report")
     lines.append("")
     lines.append(f"**Generated:** {report['generated_at']}  ")
-    lines.append(f"**Log file:** `{report['log_path']}`  ")
+    lines.append(f"**Data source:** {report.get('data_source') or 'Text log'}  ")
+    lines.append(f"**Location:** `{report['log_path']}`  ")
+    if report.get("filters"):
+        lines.append(f"**Filters:** {', '.join(str(f) for f in report['filters'])}  ")
     lines.append(f"**Events analysed:** {report['change_count']} change event(s)")
     lines.append("")
 
     if report.get("error"):
-        lines.append("## ⚠️ No log data available")
+        lines.append("## ⚠️ No log data available"
+                     if report.get("source") != "db"
+                     else "## ⚠️ No database events available")
         lines.append("")
         lines.append(f"> {report['error']}")
         lines.append("")
-        lines.append("Run the monitor first to create events:")
+        lines.append("Create events first, then import them for SQLite reports:")
         lines.append("")
         lines.append("```bash")
         lines.append("python3 main.py baseline")
         lines.append("python3 main.py watch --interval 5")
+        lines.append("python3 main.py import-events")
         lines.append("```")
         lines.append("")
         lines.append(_EDUCATIONAL_NOTE)
@@ -508,6 +601,13 @@ def render_markdown(report: Dict[str, object]) -> str:
         lines.append(f"| {name} | {counts.get(name, 0)} |")
     lines.append(f"| **Total changes** | **{report['change_count']}** |")
     lines.append("")
+    if report.get("source") == "db" and not report["change_count"]:
+        lines.append("> **No events in this view.** The database was read "
+                     "successfully but no rows matched. Widen the date range "
+                     "or clear the filters, and re-run "
+                     "`python3 main.py import-events` if nothing has been "
+                     "imported yet.")
+        lines.append("")
 
     lines.append("## Log health")
     lines.append("")
@@ -617,18 +717,35 @@ def render_html(report: Dict[str, object]) -> str:
     )
     parts.append("</head><body>")
     parts.append("<h1>FileWatch &mdash; File Integrity Report</h1>")
+    filters_html = ""
+    if report.get("filters"):
+        filters_html = ("<br>Filters: <code>"
+                        + html.escape(", ".join(str(f) for f in report["filters"]))
+                        + "</code>")
     parts.append('<p class="meta">'
                  f"Generated: <strong>{html.escape(str(report['generated_at']))}</strong><br>"
-                 f"Log file: <code>{html.escape(str(report['log_path']))}</code><br>"
+                 "Data source: "
+                 f"<strong>{html.escape(str(report.get('data_source') or 'Text log'))}</strong>"
+                 f"<br>Location: <code>{html.escape(str(report['log_path']))}</code>"
+                 f"{filters_html}<br>"
                  f"Events analysed: <strong>{int(report['change_count'])}</strong> "
                  "change event(s)</p>")
 
     if report.get("error"):
-        parts.append('<div class="empty"><strong>No log data available</strong>'
+        heading = ("No log data available" if report.get("source") != "db"
+                   else "No database events available")
+        if report.get("source") == "db":
+            hint = ("<p>Create events, then import them:<br>"
+                    "<code>python3 main.py baseline</code><br>"
+                    "<code>python3 main.py watch --interval 5</code><br>"
+                    "<code>python3 main.py import-events</code></p>")
+        else:
+            hint = ("<p>Run the monitor first:<br>"
+                    "<code>python3 main.py baseline</code><br>"
+                    "<code>python3 main.py watch --interval 5</code></p>")
+        parts.append(f'<div class="empty"><strong>{heading}</strong>'
                      f"<p>{html.escape(str(report['error']))}</p>"
-                     "<p>Run the monitor first:<br>"
-                     "<code>python3 main.py baseline</code><br>"
-                     "<code>python3 main.py watch --interval 5</code></p></div>")
+                     f"{hint}</div>")
         parts.append(f'<div class="notice"><strong>LEGAL AND ETHICAL NOTICE:</strong> '
                      f"{escaped_notice}</div>")
         parts.append(f"<p>{escaped_educational}</p>")

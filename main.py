@@ -53,7 +53,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -125,6 +125,11 @@ MIN_HMAC_KEY_BYTES = 32
 
 #: Refuse to read a key file that is readable by group or others.
 KEY_FILE_MAX_MODE = 0o600
+
+# --- WEEK 4 ENHANCED: structured JSONL events ----------------------------------------
+
+#: Default structured event file (one JSON object per line), at the project root.
+EVENTS_FILENAME = "events.jsonl"
 
 #: Patterns always ignored, even when no ignore file exists. These cover this
 #: tool's own output (its log file and the baseline temp file) plus Python byte
@@ -1779,6 +1784,59 @@ def log_result(result: Dict[str, list], logger: Optional[logging.Logger] = None)
         logger.debug("No comparable hash for %s (algorithm mismatch?)", name)
 
 
+def emit_structured_events(result: Dict[str, list],
+                           current: Optional[Dict[str, dict]] = None,
+                           baseline: Optional[Dict[str, dict]] = None,
+                           algorithm: str = DEFAULT_ALGORITHM,
+                           source: str = "watch",
+                           events_path=None,
+                           logger: Optional[logging.Logger] = None) -> int:
+    """Write detected changes to ``events.jsonl`` and return how many were written.
+
+    Week 4 enhancement. This runs *in addition to* the unchanged human-readable
+    ``filewatch.log``; it never replaces or alters that file.
+
+    Failure policy: **never fatal.** If the JSONL file cannot be written (full
+    disk, read-only folder, bad permissions), the problem is logged as a warning
+    and monitoring continues. The terminal alerts and ``filewatch.log`` still
+    record the change, so an unwritable event file degrades the tool rather
+    than breaking it - and the missed records can be recovered from
+    ``filewatch.log``.
+    """
+    if events_path is None:
+        return 0
+
+    try:
+        # Imported lazily so Week 1-4 commands keep working even if this
+        # optional module is missing from someone's checkout.
+        import event_logger
+    except ImportError as exc:  # pragma: no cover - defensive
+        (logger or get_logger()).warning(
+            "Structured event logging unavailable (%s); continuing with "
+            "filewatch.log only.", exc)
+        return 0
+
+    try:
+        records = event_logger.events_from_result(
+            result, current=current, baseline=baseline,
+            algorithm=algorithm, source=source,
+        )
+    except (ValueError, TypeError) as exc:  # pragma: no cover - defensive
+        (logger or get_logger()).warning("Could not build structured events: %s", exc)
+        return 0
+
+    if not records:
+        return 0
+
+    written, error = event_logger.append_events(records, events_path)
+    log = logger or get_logger()
+    if error:
+        log.warning("Structured event log not updated: %s", error)
+    else:
+        log.debug("Wrote %d structured event(s) to %s", written, events_path)
+    return written
+
+
 def scan_once(folder,
               baseline: Dict[str, dict],
               algorithm: str = DEFAULT_ALGORITHM,
@@ -1852,7 +1910,8 @@ def command_watch(folder=DEFAULT_FOLDER,
                   alert_once: bool = True,
                   verify_signature: bool = False,
                   require_signature: bool = False,
-                  key: Optional[bytes] = None) -> int:
+                  key: Optional[bytes] = None,
+                  events_path: Optional[str] = None) -> int:
     """``python main.py watch`` - continuous monitoring until interrupted.
 
     Behaviour
@@ -1872,6 +1931,12 @@ def command_watch(folder=DEFAULT_FOLDER,
     max_scans / iterations:
         Test hooks - stop after N scans. ``max_scans`` is the current name;
         ``iterations`` is kept as an alias for backward compatibility.
+    events_path:
+        Week 4 enhanced: where to append structured JSONL events. ``None`` (default for
+        library callers) disables it and gives exact Week 1-4 behaviour; the
+        ``watch`` command passes ``events.jsonl`` so the CLI gets the feature
+        without changing what ``import main`` does. The human-readable
+        ``filewatch.log`` is always written, unchanged.
     alert_once:
         ``True`` (default) alerts each change once, then advances an in-memory
         reference so the next scan does not repeat it. ``baseline.json`` is
@@ -1901,6 +1966,8 @@ def command_watch(folder=DEFAULT_FOLDER,
     print(f"Algorithm : {algorithm.upper().replace('SHA', 'SHA-')}")
     print(f"Interval  : {interval:g} second(s)")
     print(f"Log file  : {log_path}")
+    if events_path:
+        print(f"Events    : {events_path} (structured JSONL)")
 
     if interval < MIN_INTERVAL:
         message = (f"Interval must be >= {MIN_INTERVAL:g} seconds (got {interval:g}). "
@@ -1956,6 +2023,12 @@ def command_watch(folder=DEFAULT_FOLDER,
                 log_result(result, logger)
                 print_alerts(result, current=current, baseline=baseline,
                              algorithm=algorithm, use_colour=use_colour)
+                # Week 4 enhanced: mirror the same changes into events.jsonl. The
+                # ORIGINAL baseline supplies old_hash (the true previous
+                # state), not the moving in-memory reference.
+                emit_structured_events(result, current=current, baseline=baseline,
+                                       algorithm=algorithm, source="watch",
+                                       events_path=events_path, logger=logger)
                 if alert_once:
                     # Keep the original baseline for reporting "last known"
                     # hashes, but move the comparison reference forward so the
@@ -2040,10 +2113,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["baseline", "check", "watch", "keygen"],
+        choices=["baseline", "check", "watch", "keygen",
+                 "import-events", "query-events"],
         default=None,
         help=("'baseline' saves a hash snapshot, 'check' compares against it, "
-              "'watch' monitors continuously until interrupted"),
+              "'watch' monitors continuously until interrupted, "
+              "'import-events' loads events.jsonl into SQLite, "
+              "'query-events' filters stored events"),
     )
 
     parser.add_argument(
@@ -2134,6 +2210,52 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="'keygen': overwrite an existing key file",
     )
+    # --- Week 4 enhanced: structured events + SQLite --------------------------------
+    parser.add_argument(
+        "--events",
+        default=None,
+        metavar="PATH",
+        help=(f"'watch': structured JSONL event file "
+              f"(default: {EVENTS_FILENAME} next to the log file)"),
+    )
+    parser.add_argument(
+        "--db",
+        default="filewatch.db",
+        metavar="PATH",
+        help="'import-events'/'query-events': SQLite database (default: filewatch.db)",
+    )
+    parser.add_argument(
+        "--start",
+        default=None,
+        metavar="DATE",
+        help="'query-events': inclusive start date/time, e.g. 2026-11-01",
+    )
+    parser.add_argument(
+        "--end",
+        default=None,
+        metavar="DATE",
+        help="'query-events': inclusive end date/time, e.g. 2026-11-30",
+    )
+    parser.add_argument(
+        "--type",
+        dest="event_type",
+        default=None,
+        choices=["ADDED", "MODIFIED", "DELETED"],
+        help="'query-events': only this event type",
+    )
+    parser.add_argument(
+        "--path",
+        default=None,
+        metavar="TEXT",
+        help="'query-events': only paths containing this text",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        metavar="N",
+        help="'query-events': maximum rows to show (default: 20)",
+    )
     parser.add_argument(
         "--repeat-alerts",
         action="store_true",
@@ -2179,6 +2301,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                              algorithm=args.algorithm, ignore_path=args.ignore,
                              verify_signature=args.verify or args.require_signature,
                              require_signature=args.require_signature)
+    if args.command == "import-events":
+        return command_import_events(events_path=resolve_events_path(args.events, args.log),
+                                     db_path=args.db)
+    if args.command == "query-events":
+        return command_query_events(db_path=args.db, start=args.start,
+                                    end=args.end, event_type=args.event_type,
+                                    path=args.path, limit=args.limit)
     if args.command == "watch":
         return command_watch(folder, baseline_path=args.baseline,
                              algorithm=args.algorithm, interval=args.interval,
@@ -2187,7 +2316,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                              max_scans=1 if args.once else None,
                              alert_once=not args.repeat_alerts,
                              verify_signature=args.verify or args.require_signature,
-                             require_signature=args.require_signature)
+                             require_signature=args.require_signature,
+                             events_path=resolve_events_path(args.events, args.log))
 
     # --- Week 1 behaviour: hash everything now, optionally demonstrate ------
     results = monitor_folder(folder, algorithm=args.algorithm)
@@ -2203,6 +2333,145 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("Done. Nothing to hash.")
     print("Tip: `python main.py baseline` saves a snapshot, "
           "`python main.py check` compares against it.")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# WEEK 4 ENHANCED: SQLite commands
+# ---------------------------------------------------------------------------
+
+def resolve_events_path(events_path: Optional[str] = None,
+                       log_path: Optional[str] = None) -> str:
+    """Work out where the structured event file lives.
+
+    Priority: an explicit ``--events`` value, otherwise ``events.jsonl`` in the
+    same directory as the log file (so ``--log /tmp/x/fw.log`` puts the events
+    beside it instead of surprising the caller). Default CLI use lands both at
+    the project root, which is what the README documents.
+    """
+    if events_path:
+        return str(events_path)
+    if log_path:
+        parent = Path(log_path).parent
+        if str(parent) not in ("", "."):
+            return str(parent / EVENTS_FILENAME)
+    return EVENTS_FILENAME
+
+
+def command_import_events(events_path: Optional[str] = None,
+                          db_path: Optional[str] = None) -> int:
+    """``python main.py import-events`` - load events.jsonl into SQLite.
+
+    Safe to run repeatedly and safe to run against a file that does not exist
+    yet: duplicates are skipped, missing/empty input is reported, and existing
+    rows are never deleted.
+    """
+    events_file = Path(events_path) if events_path else Path(EVENTS_FILENAME)
+    db_file = Path(db_path) if db_path else Path("filewatch.db")
+
+    try:
+        import database
+    except ImportError as exc:
+        print(f"Error: SQLite support unavailable ({exc}).")
+        return EXIT_FAILURE
+
+    try:
+        summary = database.import_jsonl(events_file, db_file)
+    except (OSError, ValueError) as exc:
+        print(f"Error: could not import events: {exc}")
+        return EXIT_FAILURE
+
+    print(f"Events file: {summary['source']}")
+    print(f"Database   : {summary['database']}")
+    if summary["missing"]:
+        print("Events file not found - nothing to import. "
+              "Run `python main.py watch` first to generate it.")
+        return EXIT_OK
+
+    print(f"Imported   : {summary['inserted']} new event(s)")
+    print(f"Duplicates : {summary['duplicates']} already present (skipped)")
+    if summary["rejected"]:
+        print(f"Rejected   : {summary['rejected']} invalid record(s)")
+    if summary["malformed_lines"]:
+        print(f"Malformed  : {summary['malformed_lines']} line(s) could not be parsed")
+        for problem in summary["parse_errors"][:5]:  # type: ignore[index]
+            print(f"  - {problem}")
+        if len(summary["parse_errors"]) > 5:  # type: ignore[arg-type]
+            print(f"  ... and {len(summary['parse_errors']) - 5} more")
+
+    status = database.database_status(db_file)
+    if status.get("error"):
+        print(f"Warning: {status['error']}")
+        return EXIT_FAILURE
+    print(f"Total in DB: {status['events']} event(s)")
+    if status["first"]:
+        print(f"Range      : {status['first']} .. {status['last']}")
+    return EXIT_OK
+
+
+def command_query_events(db_path: Optional[str] = None,
+                         start: Optional[str] = None,
+                         end: Optional[str] = None,
+                         event_type: Optional[str] = None,
+                         path: Optional[str] = None,
+                         source: Optional[str] = None,
+                         limit: int = 20) -> int:
+    """``python main.py query-events`` - filter stored events.
+
+    Filters combine with AND. Dates are inclusive and interpreted as UTC days
+    when only a date is given.
+    """
+    db_file = Path(db_path) if db_path else Path("filewatch.db")
+    try:
+        import database
+    except ImportError as exc:
+        print(f"Error: SQLite support unavailable ({exc}).")
+        return EXIT_FAILURE
+
+    if not db_file.exists():
+        print(f"No database at {db_file}.")
+        print("Create it with: python main.py import-events")
+        return EXIT_OK
+
+    try:
+        rows = database.query_events(
+            db_file, start_date=start, end_date=end, event_type=event_type,
+            path=path, source=source, limit=limit,
+        )
+        counts = database.count_by_type(
+            db_file, start_date=start, end_date=end,
+            event_type=event_type, path=path, source=source,
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return EXIT_FAILURE
+    except Exception as exc:  # noqa: BLE001 - sqlite3.Error and friends
+        print(f"Error: could not query database: {exc}")
+        return EXIT_FAILURE
+
+    print(f"Database: {db_file}")
+    active = [f"{name}={value}" for name, value in
+              (("start", start), ("end", end), ("type", event_type),
+               ("path", path), ("source", source)) if value]
+    print(f"Filters : {', '.join(active) if active else 'none'}")
+    print(f"Matches : {len(rows)} shown (limit {limit}) | "
+          f"ADDED {counts['ADDED']}, MODIFIED {counts['MODIFIED']}, "
+          f"DELETED {counts['DELETED']}")
+
+    if not rows:
+        print("No matching events.")
+        return EXIT_OK
+
+    header = f"{'Timestamp':<21}{'Event':<10}{'Path':<34}{'Source':<8}"
+    print()
+    print(header)
+    print("-" * len(header))
+    for row in rows:
+        path_text = str(row["path"])
+        if len(path_text) > 32:
+            path_text = "..." + path_text[-29:]
+        print(f"{row['timestamp']:<21}{row['event_type']:<10}"
+              f"{path_text:<34}{row['source']:<8}")
     return EXIT_OK
 
 

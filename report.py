@@ -10,6 +10,12 @@ Week 4 command-line front-end for :mod:`logger_parser`.
     python3 report.py report --format html   # HTML integrity report
     python3 report.py report --format both   # both, at once
 
+Week 4 enhanced adds a SQLite source, so the same reports can be built from
+``filewatch.db`` instead of the text log:
+
+    python3 report.py report --source db --start 2026-11-01 --end 2026-11-30
+    python3 report.py report --source db --format both --type MODIFIED
+
 Design notes
 ------------
 * **Standard library only.** The ``table`` output is rendered by hand rather
@@ -144,24 +150,97 @@ def print_events(result: lp.ParseResult, limit: Optional[int] = None) -> int:
 # Report generation
 # ---------------------------------------------------------------------------
 
+#: Where the SQLite database lives by default (Week 4 enhanced).
+DEFAULT_DB_PATH = Path("filewatch.db")
+
+
+def _db_result(db_path, start: Optional[str] = None, end: Optional[str] = None,
+               event_type: Optional[str] = None, path: Optional[str] = None,
+               limit: Optional[int] = None) -> "lp.ParseResult":
+    """Read events from SQLite and shape them like a parsed log.
+
+    A missing, empty or corrupt database yields an *empty* result carrying a
+    human-readable ``error`` string: the report still gets written, and it says
+    plainly where the data was meant to come from and what went wrong.
+    """
+    try:
+        import database
+    except ImportError as exc:  # pragma: no cover - defensive
+        return lp.result_from_events([], source=str(db_path),
+                                     error=f"SQLite support unavailable: {exc}")
+
+    target = Path(db_path)
+    if not target.exists():
+        return lp.result_from_events(
+            [], source=str(db_path),
+            error=(f"No database at {target}. Create it with "
+                   "`python3 main.py import-events`."),
+        )
+
+    try:
+        rows = database.query_events(
+            target, start_date=start, end_date=end, event_type=event_type,
+            path=path, limit=limit, newest_first=False,
+        )
+    except ValueError as exc:
+        return lp.result_from_events([], source=str(db_path), error=str(exc))
+    except Exception as exc:  # noqa: BLE001 - sqlite3.Error and friends
+        return lp.result_from_events([], source=str(db_path),
+                                     error=f"Could not read database: {exc}")
+
+    return lp.result_from_events(rows, source=str(db_path))
+
+
 def generate_reports(log_path=lp.DEFAULT_LOG_PATH,
                      output_dir=DEFAULT_REPORT_DIR,
                      fmt: str = "md",
-                     recent_limit: int = 20) -> List[Path]:
-    """Build the requested report(s) and return the paths written.
+                     recent_limit: int = 20,
+                     source: str = "log",
+                     db_path=DEFAULT_DB_PATH,
+                     start: Optional[str] = None,
+                     end: Optional[str] = None,
+                     event_type: Optional[str] = None,
+                     path: Optional[str] = None,
+                     stem: Optional[str] = None) -> List[Path]:
+    """Build report(s) from the log **or** the SQLite database.
 
-    ``fmt`` is ``"md"``, ``"html"`` or ``"both"``.
+    ``source="log"`` keeps the Week 4 behaviour byte for byte.
+    ``source="db"`` reads ``filewatch.db`` with optional date/type/path filters.
     """
-    result = lp.parse_log_file(log_path)
-    report = lp.build_report_data(result, recent_limit=recent_limit, log_path=log_path)
+    if source not in ("log", "db"):
+        raise ValueError(f"Unsupported source {source!r}; use log or db.")
+
+    if source == "db":
+        result = _db_result(db_path, start=start, end=end,
+                            event_type=event_type, path=path)
+        report = lp.build_report_data(result, recent_limit=recent_limit,
+                                      log_path=db_path)
+    else:
+        result = lp.parse_log_file(log_path)
+        report = lp.build_report_data(result, recent_limit=recent_limit,
+                                      log_path=log_path)
+
+    # Make the data source unmistakable in the document itself.
+    report["source"] = source
+    report["data_source"] = (
+        f"SQLite database ({db_path})" if source == "db"
+        else f"Text log ({log_path})"
+    )
+    if source == "db":
+        active = [f"{name}={value}" for name, value in
+                  (("start", start), ("end", end), ("type", event_type),
+                   ("path", path)) if value]
+        report["filters"] = active
 
     output_dir = Path(output_dir)
     written: List[Path] = []
+    base = stem or (DEFAULT_REPORT_STEM if source == "log"
+                    else f"{DEFAULT_REPORT_STEM}-db")
 
     if fmt in ("md", "both"):
-        written.append(lp.write_report(report, output_dir / f"{DEFAULT_REPORT_STEM}.md"))
+        written.append(lp.write_report(report, output_dir / f"{base}.md"))
     if fmt in ("html", "both"):
-        written.append(lp.write_report(report, output_dir / f"{DEFAULT_REPORT_STEM}.html"))
+        written.append(lp.write_report(report, output_dir / f"{base}.html"))
     if not written:
         raise ValueError(f"Unsupported format {fmt!r}; use md, html or both.")
 
@@ -194,22 +273,49 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="'events': show only the N most recent events")
     parser.add_argument("--recent", type=int, default=20, metavar="N",
                         help="'report': number of recent changes to include (default: 20)")
+    # --- Week 4 enhanced: SQLite source -----------------------------------------
+    parser.add_argument("--source", default="log", choices=["log", "db"],
+                        help="where to read events from (default: log)")
+    parser.add_argument("--db", default=str(DEFAULT_DB_PATH), metavar="PATH",
+                        help=f"SQLite database for --source db (default: {DEFAULT_DB_PATH})")
+    parser.add_argument("--start", default=None, metavar="DATE",
+                        help="'--source db': inclusive start date/time, e.g. 2026-11-01")
+    parser.add_argument("--end", default=None, metavar="DATE",
+                        help="'--source db': inclusive end date/time")
+    parser.add_argument("--type", dest="event_type", default=None,
+                        choices=["ADDED", "MODIFIED", "DELETED"],
+                        help="'--source db': only this event type")
+    parser.add_argument("--path", default=None, metavar="TEXT",
+                        help="'--source db': only paths containing this text")
 
     args = parser.parse_args(argv)
 
     if args.command == "events":
-        result = lp.parse_log_file(args.log)
+        if args.source == "db":
+            result = _db_result(args.db, start=args.start, end=args.end,
+                                event_type=args.event_type, path=args.path)
+            if result.error:
+                print(f"  [WARNING] {result.error}", file=sys.stderr)
+        else:
+            result = lp.parse_log_file(args.log)
         return print_events(result, limit=args.limit)
 
     # -- report ---------------------------------------------------------
-    result = lp.parse_log_file(args.log)
+    if args.source == "db":
+        result = _db_result(args.db, start=args.start, end=args.end,
+                            event_type=args.event_type, path=args.path)
+    else:
+        result = lp.parse_log_file(args.log)
     if result.has_error:
         # Still write a report: a report that says "no data" is more useful
         # than no report at all, and it makes the failure explicit.
         print(f"  [WARNING] {result.error}", file=sys.stderr)
 
     try:
-        written = generate_reports(args.log, args.out, args.fmt, args.recent)
+        written = generate_reports(args.log, args.out, args.fmt, args.recent,
+                                   source=args.source, db_path=args.db,
+                                   start=args.start, end=args.end,
+                                   event_type=args.event_type, path=args.path)
     except (OSError, ValueError) as exc:
         print(f"  [ERROR] Could not write report: {exc}", file=sys.stderr)
         return EXIT_FAILURE
@@ -217,7 +323,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("=" * 74)
     print("FILEWATCH - INTEGRITY REPORT".center(74))
     print("=" * 74)
-    print(f"Log file : {args.log}")
+    if args.source == "db":
+        print(f"Source   : SQLite database {args.db}")
+        active = [f"{name}={value}" for name, value in
+                  (("start", args.start), ("end", args.end),
+                   ("type", args.event_type), ("path", args.path)) if value]
+        print(f"Filters  : {', '.join(active) if active else 'none'}")
+    else:
+        print(f"Log file : {args.log}")
     print(f"Summary  : {lp.summarize(result)}")
     for path in written:
         print(f"Written  : {path}  ({path.stat().st_size} bytes)")
